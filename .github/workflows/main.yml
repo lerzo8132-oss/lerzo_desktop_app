@@ -10,6 +10,10 @@ jobs:
   build-windows:
     runs-on: windows-latest
 
+    env:
+      VITE_API_BASE_URL: https://app.lerzo.com
+      VITE_APP_ENV: production
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,15 +26,24 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build Windows App
-        run: npx electron-builder --win nsis msi --publish never
+      - name: Build renderer
+        run: npm run build
+
+      - name: Verify renderer files
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/index.html")) {
+            Write-Error "ERROR: dist/index.html missing. Renderer build not included."
+            exit 1
+          }
+
+      - name: Build Windows EXE and MSI
+        run: npx electron-builder --win nsis msi --publish never --config.directories.output=release
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Lerzo-Windows
           path: |
-            dist/*.exe
-            dist/*.msi
             release/*.exe
             release/*.msi
