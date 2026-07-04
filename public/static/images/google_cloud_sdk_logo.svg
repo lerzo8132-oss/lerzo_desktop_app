@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 160" role="img" aria-label="Google Cloud SDK">
+  <path fill="#4285f4" d="M154 56h8l23-23 1-10A74 74 0 0 0 66 58a45 45 0 0 0 24 83h36l4-4v-28l-4-4H90a17 17 0 0 1-8-32l8-3 4-8a38 38 0 0 1 60-6z"/>
+  <path fill="#34a853" d="M187 141a47 47 0 0 0 0-94h-9l-24 24 4 6h29a20 20 0 1 1 0 40h-29l-4 4v16l4 4z"/>
+  <path fill="#fbbc05" d="M66 58a45 45 0 0 0 24 83h36v-36H90a17 17 0 0 1-8-32l8-3z"/>
+  <path fill="#ea4335" d="M187 47h-9l-24 24 4 6h29c5 0 10 2 14 5l26-26a47 47 0 0 0-40-9z"/>
+</svg>

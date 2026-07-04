@@ -1,0 +1,12 @@
+node_modules/
+release/
+release-clean/
+dist/
+out/
+build/
+*.exe
+*.msi
+*.zip
+*.asar
+.DS_Store
+.env

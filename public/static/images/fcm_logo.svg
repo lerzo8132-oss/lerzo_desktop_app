@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Firebase Cloud Messaging">
+  <rect width="256" height="256" rx="48" fill="#fff7e0"/>
+  <path fill="#ffa000" d="M64 204 82 42c1-7 10-9 14-3l22 42 18-34c4-7 15-5 17 3l39 154-64 36z"/>
+  <path fill="#f57c00" d="m128 240-64-36 54-123 74 123z"/>
+  <path fill="#1976d2" d="M184 91c0-13-11-24-24-24-10 0-19 6-22 15a28 28 0 0 0-45 22c0 2 0 4 1 6a34 34 0 0 0 3 68h82a44 44 0 0 0 5-87z"/>
+  <path fill="#fff" d="m132 152 36-35h-27V91l-36 35h27z"/>
+</svg>

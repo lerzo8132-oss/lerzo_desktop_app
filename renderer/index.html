@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lerzo Desktop</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-theme">
+    
+    <!-- Custom Title Bar -->
+    <div id="title-bar">
+        <div class="drag-region"></div>
+        <div class="window-controls">
+            <button id="min-btn" class="control-btn" title="Minimize">
+                <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1" y="5.5" width="10" height="1" fill="currentColor"/></svg>
+            </button>
+            <button id="max-btn" class="control-btn" title="Maximize">
+                <svg width="12" height="12" viewBox="0 0 12 12"><rect x="2" y="2" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+            </button>
+            <button id="close-btn" class="control-btn close" title="Close">
+                <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2,2 L10,10 M10,2 L2,10" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Main Content Area -->
+    <div id="app-content">
+        <!-- Loader Overlay -->
+        <div id="main-loader" class="loader-overlay">
+            <div class="spinner"></div>
+            <p>Securely Connecting...</p>
+        </div>
+
+        <!-- Offline Overlay (Internal fallback) -->
+        <div id="offline-overlay" class="loader-overlay hidden">
+            <div class="offline-msg">
+                <h1>Connection Lost</h1>
+                <p>Reconnecting automatically...</p>
+            </div>
+        </div>
+
+        <iframe id="main-frame" src="about:blank" frameborder="0"></iframe>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

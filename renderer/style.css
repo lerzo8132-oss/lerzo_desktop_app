@@ -1,0 +1,157 @@
+:root {
+    --bg-color: #0a0a0c;
+    --title-bar-bg: rgba(10, 10, 12, 0.9);
+    --accent-color: #8b5cf6;
+    --text-color: #f8fafc;
+    --text-muted: #94a3b8;
+    --control-hover: rgba(255, 255, 255, 0.05);
+    --control-close-hover: #ef4444;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+}
+
+/* Title Bar */
+#title-bar {
+    height: 30px; /* COMPACT HEIGHT */
+    background: var(--title-bar-bg);
+    backdrop-filter: blur(10px);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    z-index: 1000;
+}
+
+/* Platform Adjustments */
+body.platform-mac #title-bar {
+    padding-left: 80px; /* Standard macOS compact offset */
+}
+
+body.platform-mac .window-controls {
+    display: none; /* Hide custom buttons on Mac */
+}
+
+body.platform-win .app-title {
+    margin-left: 0;
+}
+
+.drag-region {
+    flex: 1;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    padding-left: 12px;
+    -webkit-app-region: drag;
+}
+
+.app-icon {
+    width: 18px;
+    height: 18px;
+    margin-right: 10px;
+}
+
+.app-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+}
+
+.window-controls {
+    display: flex;
+    height: 100%;
+    -webkit-app-region: no-drag;
+}
+
+.control-btn {
+    width: 32px; /* Smaller Windows controls */
+    height: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: all 0.2s;
+}
+
+.control-btn:hover {
+    background: var(--control-hover);
+    color: var(--text-color);
+}
+
+.control-btn.close:hover {
+    background: var(--control-close-hover);
+    color: white;
+}
+
+/* Content Area */
+#app-content {
+    flex: 1;
+    position: relative;
+    background: var(--bg-color);
+}
+
+#main-frame {
+    width: 100%;
+    height: 100%;
+    border: none;
+    background: var(--bg-color);
+}
+
+/* Overlays */
+.loader-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: var(--bg-color);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    z-index: 500;
+    transition: opacity 0.5s;
+}
+
+.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.spinner {
+    width: 30px;
+    height: 30px;
+    border: 3px solid rgba(139, 92, 246, 0.1);
+    border-top-color: var(--accent-color);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-bottom: 20px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.offline-msg h1 {
+    color: var(--accent-color);
+    font-size: 20px;
+    margin-bottom: 10px;
+}
+
+.offline-msg p {
+    color: var(--text-muted);
+}

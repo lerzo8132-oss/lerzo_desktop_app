@@ -1,0 +1,32 @@
+:root {
+    /* Colors */
+    --bg-primary:       #FFFFFF;
+    --bg-secondary:     #F7F8FA;
+    --bg-card:          #FFFFFF;
+    --border:           #E8EAED;
+    --accent:           #2563EB;
+    --accent-light:     #EFF6FF;
+    --accent-hover:     #1D4ED8;
+    --text-primary:     #111827;
+    --text-secondary:   #6B7280;
+    --text-muted:       #9CA3AF;
+    --success:          #10B981;
+    --warning:          #F59E0B;
+    --danger:           #EF4444;
+    
+    /* Shadows */
+    --shadow-sm:        0 1px 3px rgba(0,0,0,0.06);
+    --shadow-md:        0 4px 16px rgba(0,0,0,0.08);
+    --shadow-lg:        0 4px 16px rgba(0,0,0,0.10);
+
+    /* Spacing (8px grid) */
+    --space-1: 8px;
+    --space-2: 16px;
+    --space-3: 24px;
+    --space-4: 32px;
+    --space-6: 48px;
+
+    /* Transitions */
+    --transition-fast: 150ms ease;
+    --transition-normal: 200ms ease;
+}
