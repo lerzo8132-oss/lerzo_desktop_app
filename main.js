@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, shell, Tray, Menu, session, safeStorage } =
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
-const { loadApiConfig } = require('./config/loadApiConfig');
+const { loadApiConfig, probeBackendHealth } = require('./config/loadApiConfig');
 
 let autoUpdater = {
     checkForUpdatesAndNotify: () => Promise.resolve(false)
@@ -35,6 +35,7 @@ process.on('uncaughtException', (error) => {
 let mainWindow;
 let splashWindow;
 let tray = null;
+let rendererLoadedOnce = false;
 let apiMonitorState = {
     requests: [],
     errors: [],
@@ -64,6 +65,7 @@ const IS_PROD = app.isPackaged;
 const ELECTRON_DEBUG = ['1', 'true', 'yes'].includes(String(process.env.LERZO_ELECTRON_DEBUG || '').trim().toLowerCase());
 const RENDERER_DEV_URL = (process.env.ELECTRON_RENDERER_URL || `http://${['127', '0', '0', '1'].join('.')}:5173`).replace(/\/$/, '');
 const SPLASH_FALLBACK_MS = 15000;
+const IGNORED_FAIL_LOAD_CODES = new Set([-3]); // ERR_ABORTED during hash navigation
 let API_CONFIG = null;
 let splashFallbackTimer = null;
 
@@ -92,37 +94,24 @@ function getApiConfig() {
 }
 
 async function assertBackendAvailableForLogin(config) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3500);
-    try {
-        console.log(`[Electron Health] url=${config.healthUrl}`);
-        const response = await fetch(config.healthUrl, {
-            method: 'GET',
-            signal: controller.signal,
-            credentials: 'include',
-            headers: {
-                Accept: 'application/json'
-            }
-        });
-        console.log('[Electron Health] status =', response.status);
-        if (!response.ok) {
-            throw new Error(`Health check failed with ${response.status}`);
-        }
-        const payload = await response.json().catch(() => null);
-        if (!payload || payload.status !== 'ok' || payload.success !== true) {
-            throw new Error('Health check returned an invalid response');
-        }
-    } catch (error) {
-        console.log('[Electron Health] status = offline');
+    const result = await probeBackendHealth(config, { timeoutMs: 3500 });
+    startupLog('Login health probe', {
+        apiBaseUrl: config.apiBaseUrl,
+        healthUrl: result.healthUrl,
+        status: result.status,
+        reachable: result.reachable,
+        error: result.error || null,
+    });
+    if (!result.reachable) {
         console.error('[Electron Error] backend unavailable', {
             mode: config.configMode,
             apiBaseUrl: config.apiBaseUrl,
-            healthUrl: config.healthUrl,
-            error: error && error.message ? error.message : String(error)
+            healthUrl: result.healthUrl,
+            status: result.status,
+            error: result.error || 'Health check failed',
+            attempts: result.attempts,
         });
         throw new Error('Server is currently unavailable');
-    } finally {
-        clearTimeout(timeout);
     }
 }
 const AUTH_SUGGESTIONS_FILE = path.join(app.getPath('userData'), 'auth-suggestions.json');
@@ -370,35 +359,24 @@ function pushMonitorEvent(event) {
 }
 
 async function pingBackend() {
-    const start = Date.now();
-    const { healthUrl } = getApiConfig();
-    try {
-        // Public health check only. Protected data endpoints require a JWT and
-        // must not be polled by the shell before login.
-        console.log(`[Electron Health] url=${healthUrl}`);
-        const response = await fetch(healthUrl, {
-            method: 'GET',
-            credentials: 'include',
-            headers: {
-                Accept: 'application/json'
-            }
-        });
-        const latency = Date.now() - start;
-        const payload = await response.json().catch(() => null);
-        const reachable = response.ok && payload?.status === 'ok' && payload?.success === true;
-        apiMonitorState.network.backendReachable = reachable;
-        apiMonitorState.network.apiConnected = reachable;
-        apiMonitorState.network.databaseReachable = reachable;
-        apiMonitorState.network.lastLatencyMs = latency;
-        apiMonitorState.network.lastCheckedAt = new Date().toISOString();
-        apiMonitorState.network.status = reachable ? (latency > 1200 ? 'slow' : 'connected') : 'offline';
-    } catch {
-        apiMonitorState.network.apiConnected = false;
-        apiMonitorState.network.backendReachable = false;
-        apiMonitorState.network.databaseReachable = false;
-        apiMonitorState.network.status = 'offline';
-        apiMonitorState.network.lastCheckedAt = new Date().toISOString();
-    }
+    const config = getApiConfig();
+    const result = await probeBackendHealth(config, { timeoutMs: 5000 });
+    startupLog('Backend health probe', {
+        apiBaseUrl: config.apiBaseUrl,
+        healthUrl: result.healthUrl,
+        status: result.status,
+        reachable: result.reachable,
+        latencyMs: result.latencyMs,
+        error: result.error || null,
+    });
+    apiMonitorState.network.backendReachable = result.reachable;
+    apiMonitorState.network.apiConnected = result.reachable;
+    apiMonitorState.network.databaseReachable = result.reachable;
+    apiMonitorState.network.lastLatencyMs = result.latencyMs;
+    apiMonitorState.network.lastCheckedAt = new Date().toISOString();
+    apiMonitorState.network.status = result.reachable
+        ? ((result.latencyMs || 0) > 1200 ? 'slow' : 'connected')
+        : 'offline';
 }
 
 function bootstrapApiMonitorBridge() {
@@ -857,18 +835,33 @@ function createMainWindow() {
     });
 
     mainWindow.webContents.on('did-finish-load', () => {
-        startupLog('Renderer did-finish-load', { url: mainWindow.webContents.getURL() });
+        const url = mainWindow.webContents.getURL();
+        startupLog('Renderer did-finish-load', { url });
+        if (url.includes('index.html') || url.includes('/dist/') || url.startsWith(RENDERER_DEV_URL)) {
+            rendererLoadedOnce = true;
+        }
     });
 
     // Handle failure to load
     mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-        if (!isMainFrame) return;
+        if (!isMainFrame || IGNORED_FAIL_LOAD_CODES.has(errorCode)) {
+            return;
+        }
+        if (rendererLoadedOnce && validatedURL.includes('index.html')) {
+            startupLog('Renderer did-fail-load ignored after successful boot', {
+                errorCode,
+                errorDescription,
+                validatedURL,
+            });
+            return;
+        }
         const offlinePath = path.join(app.getAppPath(), 'offline', 'offline.html');
         startupLog('Renderer did-fail-load', {
             errorCode,
             errorDescription,
             validatedURL,
-            offlinePath
+            offlinePath,
+            rendererLoadedOnce,
         });
         closeSplashWindow();
         if (validatedURL !== offlinePath && !validatedURL.includes('offline/offline.html')) {
@@ -1023,7 +1016,16 @@ if (gotSingleInstanceLock) {
         });
 
         getApiConfig();
-        const { healthUrl, googleLoginUrl } = getApiConfig();
+        const config = getApiConfig();
+        const { healthUrl, googleLoginUrl } = config;
+        startupLog('API config loaded for startup', {
+            apiBaseUrl: config.apiBaseUrl,
+            desktopApiBaseUrl: config.desktopApiBaseUrl,
+            healthUrl,
+            healthUrls: config.healthUrls,
+            configPath: config.configPath,
+            appEnv: config.appEnv,
+        });
         console.log(`[Lerzo] Desktop health check endpoint: ${healthUrl}`);
         console.log(`[Lerzo] Desktop Google login endpoint: ${googleLoginUrl}`);
         if (process.defaultApp) {
@@ -1094,6 +1096,19 @@ ipcMain.handle('open-location-settings', async () => {
 });
 
 ipcMain.handle('get-api-config', async () => getApiConfig());
+
+ipcMain.handle('check-backend-health', async () => {
+    const config = getApiConfig();
+    const result = await probeBackendHealth(config, { timeoutMs: 5000 });
+    startupLog('Renderer backend health check', {
+        apiBaseUrl: config.apiBaseUrl,
+        healthUrl: result.healthUrl,
+        status: result.status,
+        reachable: result.reachable,
+        error: result.error || null,
+    });
+    return result;
+});
 
 ipcMain.handle('get-secure-auth-token', async () => loadSecureAuthToken());
 

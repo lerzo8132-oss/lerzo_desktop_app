@@ -1,15 +1,41 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
-const expectedUrl = 'https://app.lerzo.com';
+const expectedOrigin = 'https://app.lerzo.com';
 const sourcePath = resolve('config/api-config.production.json');
 const targetPath = resolve('config/api-config.json');
 
-copyFileSync(sourcePath, targetPath);
+function resolveProductionOrigin(raw, fallback = expectedOrigin) {
+  const source = String(raw || fallback).trim();
+  if (!source) {
+    return fallback;
+  }
+
+  try {
+    const parsed = new URL(source.includes('://') ? source : `https://${source}`);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return fallback;
+  }
+}
+
+const apiBaseUrl = resolveProductionOrigin(
+  process.env.VITE_API_BASE_URL || process.env.LERZO_API_BASE_URL,
+  expectedOrigin,
+);
+const appEnv = String(process.env.VITE_APP_ENV || 'production').trim() || 'production';
+
+const productionConfig = {
+  apiBaseUrl,
+  webBaseUrl: apiBaseUrl,
+  appEnv,
+};
+
+writeFileSync(targetPath, `${JSON.stringify(productionConfig, null, 2)}\n`);
 
 const config = JSON.parse(readFileSync(targetPath, 'utf8'));
-if (config.apiBaseUrl !== expectedUrl || config.webBaseUrl !== expectedUrl) {
-  throw new Error('Production API config must point to https://app.lerzo.com');
+if (config.apiBaseUrl !== expectedOrigin || config.webBaseUrl !== expectedOrigin) {
+  throw new Error(`Production API config must resolve to ${expectedOrigin}, got ${config.apiBaseUrl}`);
 }
 
 const winIconSource = resolve('assets/LOGO.ico');
@@ -27,6 +53,7 @@ if (!existsSync(logoSource)) {
 mkdirSync(dirname(logoTarget), { recursive: true });
 copyFileSync(logoSource, logoTarget);
 
-console.log(`[API CONFIG] production config prepared: ${expectedUrl}`);
+console.log(`[API CONFIG] production config prepared: ${config.apiBaseUrl}`);
+console.log(`[API CONFIG] appEnv=${config.appEnv}`);
 console.log(`[BUILD] Windows icon ready: ${winIconTarget}`);
 console.log(`[BUILD] Renderer logo ready: ${logoTarget}`);

@@ -21,14 +21,17 @@ interface Window {
     getApiConfig?: () => Promise<{
       configMode?: string;
       configPath?: string | null;
+      appEnv?: string;
       apiBaseUrl: string;
       webBaseUrl: string;
       desktopApiBaseUrl: string;
       healthUrl: string;
+      healthUrls?: string[];
       googleLoginUrl: string;
       meUrl: string;
       logoutUrl: string;
     }>;
+    checkInternet?: () => Promise<boolean>;
     getSecureAuthToken?: () => Promise<string | null>;
     setSecureAuthToken?: (token: string) => Promise<boolean>;
     clearSecureAuthToken?: () => Promise<boolean>;
@@ -46,6 +49,8 @@ interface Window {
 
 interface ImportMetaEnv {
   readonly BASE_URL: string;
+  readonly VITE_API_BASE_URL?: string;
+  readonly VITE_APP_ENV?: string;
 }
 
 interface ImportMeta {

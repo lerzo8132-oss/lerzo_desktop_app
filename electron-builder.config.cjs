@@ -45,6 +45,7 @@ module.exports = {
     'assets/**',
     'build/**',
     'config/loadApiConfig.js',
+    'config/api-config*.json',
   ],
   extraResources: [
     {

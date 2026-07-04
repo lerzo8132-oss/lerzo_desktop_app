@@ -1,10 +1,12 @@
 export type ApiConfig = {
   configMode?: string;
   configPath?: string | null;
+  appEnv?: string;
   apiBaseUrl: string;
   webBaseUrl: string;
   desktopApiBaseUrl: string;
   healthUrl: string;
+  healthUrls?: string[];
   googleLoginUrl: string;
   meUrl: string;
   logoutUrl: string;
@@ -16,6 +18,28 @@ const FORBIDDEN_PATH_SUFFIXES = ['/login', '/dashboard', '/api', '/auth', '/desk
 
 let cachedConfig: ApiConfig | null = null;
 let initPromise: Promise<ApiConfig> | null = null;
+
+export function resolveProductionOrigin(value?: string | null, fallback = DEFAULT_PRODUCTION_URL): string {
+  const source = String(value || fallback || DEFAULT_PRODUCTION_URL).trim();
+  if (!source) {
+    return DEFAULT_PRODUCTION_URL;
+  }
+
+  try {
+    const parsed = new URL(source.includes('://') ? source : `https://${source}`);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return String(fallback || DEFAULT_PRODUCTION_URL).replace(/\/+$/, '');
+  }
+}
+
+function buildHealthUrls(apiBaseUrl: string): string[] {
+  return [
+    joinUrl(apiBaseUrl, '/desktop-api/health'),
+    joinUrl(apiBaseUrl, '/api/health'),
+    joinUrl(apiBaseUrl, '/api/staff/health'),
+  ];
+}
 
 export function normalizeBaseUrl(value?: string | null, fallback = DEFAULT_PRODUCTION_URL): string {
   const source = String(value || fallback || DEFAULT_PRODUCTION_URL).trim();
@@ -63,16 +87,20 @@ export function joinDesktopApiUrl(desktopApiBaseUrl: string, routePath: string):
 }
 
 function buildFallbackConfig(): ApiConfig {
+  const envOrigin = resolveProductionOrigin(import.meta.env.VITE_API_BASE_URL, DEFAULT_PRODUCTION_URL);
   console.warn('[API CONFIG] api-config.json missing, using default production URL');
-  const apiBaseUrl = normalizeBaseUrl(DEFAULT_PRODUCTION_URL);
-  const webBaseUrl = normalizeBaseUrl(DEFAULT_PRODUCTION_URL);
+  const apiBaseUrl = envOrigin;
+  const webBaseUrl = envOrigin;
+  const healthUrls = buildHealthUrls(apiBaseUrl);
   return {
-    configMode: 'production',
+    configMode: import.meta.env.VITE_APP_ENV || 'production',
     configPath: null,
+    appEnv: import.meta.env.VITE_APP_ENV || 'production',
     apiBaseUrl,
     webBaseUrl,
     desktopApiBaseUrl: joinUrl(apiBaseUrl, '/desktop-api'),
-    healthUrl: joinUrl(apiBaseUrl, '/desktop-api/health'),
+    healthUrl: healthUrls[0],
+    healthUrls,
     googleLoginUrl: joinUrl(webBaseUrl, '/auth/google/login?app=electron&electron_callback=1'),
     meUrl: joinUrl(apiBaseUrl, '/desktop-api/auth/me'),
     logoutUrl: joinUrl(apiBaseUrl, '/desktop-api/auth/logout'),
@@ -82,29 +110,41 @@ function buildFallbackConfig(): ApiConfig {
 
 function logApiConfig(config: ApiConfig) {
   console.info('[API CONFIG] mode =', config.configMode || 'unknown');
+  console.info('[API CONFIG] appEnv =', config.appEnv || import.meta.env.VITE_APP_ENV || 'production');
   console.info('[API CONFIG] file =', config.configPath || 'none');
   console.info(`[API CONFIG] apiBaseUrl=${config.apiBaseUrl}`);
+  console.info(`[API CONFIG] desktopApiBaseUrl=${config.desktopApiBaseUrl}`);
   console.info(`[API CONFIG] webBaseUrl=${config.webBaseUrl}`);
   console.info('[Electron Auth] googleLoginUrl =', config.googleLoginUrl);
   console.info(`[Electron Health] url=${config.healthUrl}`);
+  if (config.healthUrls?.length) {
+    console.info('[API CONFIG] healthUrls =', config.healthUrls);
+  }
 }
 
 async function loadRendererApiConfig(): Promise<ApiConfig> {
   const fromMain = await window.electronAPI?.getApiConfig?.();
   if (fromMain?.apiBaseUrl && fromMain?.webBaseUrl) {
+    const apiBaseUrl = resolveProductionOrigin(fromMain.apiBaseUrl);
+    const webBaseUrl = resolveProductionOrigin(fromMain.webBaseUrl || fromMain.apiBaseUrl);
+    const healthUrls = fromMain.healthUrls?.length
+      ? fromMain.healthUrls
+      : buildHealthUrls(apiBaseUrl);
     return {
       configMode: fromMain.configMode,
       configPath: fromMain.configPath,
-      apiBaseUrl: normalizeBaseUrl(fromMain.apiBaseUrl),
-      webBaseUrl: normalizeBaseUrl(fromMain.webBaseUrl || fromMain.apiBaseUrl),
-      desktopApiBaseUrl: fromMain.desktopApiBaseUrl || joinUrl(fromMain.apiBaseUrl, '/desktop-api'),
-      healthUrl: fromMain.healthUrl || joinUrl(fromMain.apiBaseUrl, '/desktop-api/health'),
+      appEnv: fromMain.appEnv || import.meta.env.VITE_APP_ENV || 'production',
+      apiBaseUrl,
+      webBaseUrl,
+      desktopApiBaseUrl: fromMain.desktopApiBaseUrl || joinUrl(apiBaseUrl, '/desktop-api'),
+      healthUrl: fromMain.healthUrl || healthUrls[0],
+      healthUrls,
       googleLoginUrl:
         fromMain.googleLoginUrl
-        || joinUrl(fromMain.webBaseUrl || fromMain.apiBaseUrl, '/auth/google/login?app=electron&electron_callback=1'),
-      meUrl: fromMain.meUrl || joinUrl(fromMain.apiBaseUrl, '/desktop-api/auth/me'),
-      logoutUrl: fromMain.logoutUrl || joinUrl(fromMain.apiBaseUrl, '/desktop-api/auth/logout'),
-      registerUrl: fromMain.registerUrl || joinUrl(fromMain.apiBaseUrl, '/desktop-api/auth/register'),
+        || joinUrl(webBaseUrl, '/auth/google/login?app=electron&electron_callback=1'),
+      meUrl: fromMain.meUrl || joinUrl(apiBaseUrl, '/desktop-api/auth/me'),
+      logoutUrl: fromMain.logoutUrl || joinUrl(apiBaseUrl, '/desktop-api/auth/logout'),
+      registerUrl: fromMain.registerUrl || joinUrl(apiBaseUrl, '/desktop-api/auth/register'),
     };
   }
 
