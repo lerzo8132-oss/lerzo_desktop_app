@@ -23,7 +23,7 @@ jobs:
         run: npm install
 
       - name: Build Windows App
-        run: npm run dist
+        run: npx electron-builder --win nsis msi
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
