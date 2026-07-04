@@ -26,7 +26,7 @@
     "sanitize:prod-build": "node scripts/sanitize-production-build.mjs",
     "build": "npm run prepare:prod-config && npm run vite:build && npm run sanitize:prod-build && electron-builder",
     "build:prod": "npm run build",
-    "build:win": "npm run prepare:prod-config && npm run vite:build && npm run sanitize:prod-build && electron-builder --win --x64",
+    "build:win": "npm run prepare:prod-config && npm run vite:build && npm run sanitize:prod-build && electron-builder --win nsis msi --x64",
     "dist:win": "npm run build:win",
     "build:mac": "npm run vite:build && electron-builder --mac",
     "build:linux": "npm run vite:build && electron-builder --linux",

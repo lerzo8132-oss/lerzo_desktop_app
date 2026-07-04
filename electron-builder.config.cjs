@@ -7,15 +7,23 @@
  * APP ID:       appId below (Windows/macOS installer identity)
  * EXECUTABLE:   executableName below (Windows .exe file name)
  *
+ * ── Windows icon (required for NSIS + MSI — do not remove) ───────────────
+ * WIN_ICON must point to a committed .ico file. MSI WiX shortcuts reference
+ * this icon; if missing, Light.exe fails with LGHT0094 (Icon:LerzoIcon.exe).
+ *
  * ── Windows installer outputs (GitHub Actions / npm run dist:win) ─────────
  *   release/Lerzo-Setup-<version>.exe   (NSIS, Windows 10/11 x64)
  *   release/Lerzo-Setup-<version>.msi   (MSI, Windows 10/11 x64)
  *
  * ── Code signing (optional, disabled for now) ──────────────────────────────
  * To enable later, set CSC_LINK / CSC_KEY_PASSWORD in CI or locally and
- * configure certificateFile / certificatePassword in the win block below.
+ * uncomment certificateFile / certificatePassword in the win block below.
  */
+const path = require('path');
 const pkg = require('./package.json');
+
+// Committed Windows icon — used by NSIS, MSI (WiX), and the packaged .exe metadata.
+const WIN_ICON = path.resolve(__dirname, 'assets', 'LOGO.ico');
 
 /** @type {import('electron-builder').Configuration} */
 module.exports = {
@@ -56,7 +64,7 @@ module.exports = {
       },
     ],
     category: 'public.app-category.productivity',
-    icon: 'build/icon.icns',
+    icon: path.resolve(__dirname, 'build', 'icon.icns'),
     artifactName: 'Lerzo-mac-${arch}.${ext}',
     darkModeSupport: true,
     hardenedRuntime: false,
@@ -70,14 +78,14 @@ module.exports = {
   },
   dmg: {
     title: 'Lerzo Installer',
-    icon: 'build/icon.icns',
+    icon: path.resolve(__dirname, 'build', 'icon.icns'),
   },
   win: {
     target: [
       { target: 'nsis', arch: ['x64'] },
       { target: 'msi', arch: ['x64'] },
     ],
-    icon: 'build/icon.ico',
+    icon: WIN_ICON,
     requestedExecutionLevel: 'asInvoker',
     publisherName: 'Lerzo',
     // Code signing disabled until certificates are configured.
@@ -94,9 +102,9 @@ module.exports = {
     createDesktopShortcut: true,
     createStartMenuShortcut: true,
     shortcutName: pkg.productName,
-    installerIcon: 'build/icon.ico',
-    uninstallerIcon: 'build/icon.ico',
-    installerHeaderIcon: 'build/icon.ico',
+    installerIcon: WIN_ICON,
+    uninstallerIcon: WIN_ICON,
+    installerHeaderIcon: WIN_ICON,
     artifactName: 'Lerzo-Setup-${version}.${ext}',
   },
   msi: {
@@ -109,7 +117,7 @@ module.exports = {
   },
   linux: {
     target: ['AppImage'],
-    icon: 'build/icon.png',
+    icon: path.resolve(__dirname, 'build', 'icon.png'),
     category: 'Utility',
     artifactName: 'Lerzo-linux-${arch}.${ext}',
   },

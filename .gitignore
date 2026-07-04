@@ -3,7 +3,10 @@ release/
 release-clean/
 dist/
 out/
-build/
+build/*
+!build/icon.ico
+!build/icon.icns
+!build/icon.png
 *.exe
 *.msi
 *.zip
