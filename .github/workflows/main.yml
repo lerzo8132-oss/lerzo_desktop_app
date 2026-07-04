@@ -17,18 +17,20 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Install dependencies
         run: npm install
 
       - name: Build Windows App
-        run: npx electron-builder --win nsis msi
+        run: npx electron-builder --win nsis msi --publish never
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Lerzo-Windows
           path: |
+            dist/*.exe
+            dist/*.msi
             release/*.exe
             release/*.msi
