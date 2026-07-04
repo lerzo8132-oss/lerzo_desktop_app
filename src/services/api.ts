@@ -84,6 +84,10 @@ export async function getAuthToken() {
   return inMemoryToken;
 }
 
+export function resetAuthTokenCache() {
+  inMemoryToken = null;
+}
+
 export async function clearAuthTokens() {
   inMemoryToken = null;
   await window.electronAPI?.clearSecureAuthToken?.();

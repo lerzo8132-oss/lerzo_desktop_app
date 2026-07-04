@@ -211,7 +211,7 @@ function Sidebar() {
 
 function AppRoutes() {
   const location = useLocation();
-  const { bootReady, refreshing, isAuthenticated, authError } = useAuth();
+  const { bootReady, loginCompleting, refreshing, isAuthenticated, authError } = useAuth();
   const isPublicPath = publicPaths.has(location.pathname);
 
   useBootRouteReady();
@@ -219,6 +219,10 @@ function AppRoutes() {
 
   if (!bootReady) {
     return null;
+  }
+
+  if (loginCompleting) {
+    return <LoadingScreen message="Signing you in..." />;
   }
 
   if (!isAuthenticated && authError && !isPublicPath && location.pathname !== '/auth-error') {

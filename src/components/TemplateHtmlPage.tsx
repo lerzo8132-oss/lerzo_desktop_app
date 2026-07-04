@@ -539,9 +539,6 @@ async function completeElectronLoginFromToken(root: HTMLElement) {
   hideElectronLoginLoading(root);
   window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
   window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
-  if (!window.location.hash.startsWith('#/dashboard')) {
-    window.location.hash = '#/dashboard';
-  }
 }
 
 function startDesktopAuthCompletionWatch(root: HTMLElement) {
@@ -572,12 +569,9 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
 
       const token = await window.electronAPI?.getSecureAuthToken?.();
       if (token) {
-        const user = await loadCurrentUser().catch(() => null);
-        if (user) {
-          stop();
-          await completeElectronLoginFromToken(root);
-          return;
-        }
+        stop();
+        await completeElectronLoginFromToken(root);
+        return;
       }
     } catch (error) {
       console.warn('[Renderer Auth] desktop login poll failed =', error);

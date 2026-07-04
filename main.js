@@ -746,9 +746,6 @@ async function notifyRendererLoginComplete() {
     await mainWindow.webContents.executeJavaScript(`
         window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
         window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
-        if (!window.location.hash.startsWith('#/dashboard')) {
-            window.location.hash = '#/dashboard';
-        }
     `, true).catch(() => {});
 }
 

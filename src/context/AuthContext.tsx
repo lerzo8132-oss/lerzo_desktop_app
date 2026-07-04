@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { AuthVerificationError, loadCurrentUser, logout as logoutRequest, refreshDesktopSession } from '../services/auth';
-import { clearAuthTokens, getAuthToken } from '../services/api';
+import { clearAuthTokens, getAuthToken, resetAuthTokenCache } from '../services/api';
 import { forceHideAllLoading } from '../services/appShell';
 import {
   AUTH_CHECK_TIMEOUT_MS,
@@ -19,6 +19,7 @@ interface AuthContextValue {
   loading: boolean;
   bootReady: boolean;
   refreshing: boolean;
+  loginCompleting: boolean;
   isAuthenticated: boolean;
   authError: string | null;
   refreshUser: () => Promise<boolean>;
@@ -43,6 +44,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [bootReady, setBootReady] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [loginCompleting, setLoginCompleting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const callbackInFlight = useRef(false);
   const refreshInFlight = useRef<Promise<boolean> | null>(null);
@@ -142,6 +144,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     callbackInFlight.current = true;
+    setLoginCompleting(true);
+    resetAuthTokenCache();
+    refreshInFlight.current = null;
+
     try {
       const ok = await refreshUser({ silent: true });
       if (ok) {
@@ -155,6 +161,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return false;
     } finally {
       callbackInFlight.current = false;
+      setLoginCompleting(false);
     }
   }, [refreshUser]);
 
@@ -163,6 +170,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await logoutRequest();
     setUser(null);
     setAuthError(null);
+    resetAuthTokenCache();
+    refreshInFlight.current = null;
+    if (window.location.hash !== '#/auth-login') {
+      window.location.hash = '#/auth-login';
+    }
   }, []);
 
   useEffect(() => {
@@ -188,6 +200,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
 
     const handleAuthChanged = () => {
+      if (callbackInFlight.current) return;
       void refreshUser({ silent: true });
     };
 
@@ -215,12 +228,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loading,
     bootReady,
     refreshing,
+    loginCompleting,
     isAuthenticated: Boolean(user),
     authError,
     refreshUser: () => refreshUser({ silent: Boolean(user) }),
     handleLoginCallback,
     logout,
-  }), [authError, bootReady, handleLoginCallback, loading, logout, refreshUser, refreshing, user]);
+  }), [authError, bootReady, handleLoginCallback, loading, loginCompleting, logout, refreshUser, refreshing, user]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
