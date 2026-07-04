@@ -32,6 +32,7 @@ interface Window {
       logoutUrl: string;
     }>;
     checkInternet?: () => Promise<boolean>;
+    pollDesktopAuthToken?: () => Promise<{ ready: boolean; error?: string }>;
     getSecureAuthToken?: () => Promise<string | null>;
     setSecureAuthToken?: (token: string) => Promise<boolean>;
     clearSecureAuthToken?: () => Promise<boolean>;

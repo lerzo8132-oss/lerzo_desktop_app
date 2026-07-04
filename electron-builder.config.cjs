@@ -54,6 +54,10 @@ module.exports = {
       filter: ['api-config*.json'],
     },
   ],
+  protocols: {
+    name: 'Lerzo',
+    schemes: ['lerzo'],
+  },
   asar: true,
   compression: 'maximum',
   removePackageScripts: true,

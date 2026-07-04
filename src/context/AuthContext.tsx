@@ -195,11 +195,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       void handleLoginCallback();
     });
 
+    const handleLoginComplete = () => {
+      void handleLoginCallback();
+    };
+
     window.addEventListener('lerzo-auth-changed', handleAuthChanged as EventListener);
+    window.addEventListener('lerzo-login-complete', handleLoginComplete as EventListener);
     return () => {
       cancelled = true;
       window.clearTimeout(safetyTimer);
       window.removeEventListener('lerzo-auth-changed', handleAuthChanged as EventListener);
+      window.removeEventListener('lerzo-login-complete', handleLoginComplete as EventListener);
       unsubscribeAuthToken?.();
     };
   }, [finishBoot, handleLoginCallback, refreshUser]);

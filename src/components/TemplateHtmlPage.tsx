@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { applyTheme, getStoredThemePreference } from '../theme';
 import { getApiBaseUrl, getDesktopApiBaseUrl, getWebBaseUrl, joinUrl } from '../config/api';
 import { APP_LOGO_SRC, AUTH_ILLUSTRATION_SRC, EXPORT_ILLUSTRATION_SRC } from '../config/assets';
-import { registerDesktopUser } from '../services/auth';
+import { registerDesktopUser, loadCurrentUser } from '../services/auth';
 import { clearAuthTokens } from '../services/api';
 import { extractApiErrorMessage } from '../services/apiErrors';
 import {
@@ -514,6 +514,105 @@ async function startElectronGoogleLogin() {
   throw new Error('Desktop login bridge is unavailable. Restart the app and try again.');
 }
 
+function hideElectronLoginLoading(root: HTMLElement) {
+  const loading = root.querySelector<HTMLElement>('#auth-loading');
+  const button = root.querySelector<HTMLButtonElement>('#google-login-btn');
+  if (loading) {
+    loading.style.display = 'none';
+    loading.style.pointerEvents = 'none';
+  }
+  if (button) {
+    button.disabled = false;
+    button.removeAttribute('disabled');
+  }
+}
+
+function showElectronLoginRetry(root: HTMLElement, message: string) {
+  hideElectronLoginLoading(root);
+  const errorBox = root.querySelector<HTMLElement>('#config-error');
+  const errorMessage = root.querySelector<HTMLElement>('#error-message');
+  if (errorMessage) errorMessage.textContent = message;
+  if (errorBox) errorBox.style.display = 'block';
+}
+
+async function completeElectronLoginFromToken(root: HTMLElement) {
+  hideElectronLoginLoading(root);
+  window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
+  window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
+  if (!window.location.hash.startsWith('#/dashboard')) {
+    window.location.hash = '#/dashboard';
+  }
+}
+
+function startDesktopAuthCompletionWatch(root: HTMLElement) {
+  let stopped = false;
+  let attempts = 0;
+  const maxAttempts = 30;
+  let pollTimer: number | undefined;
+
+  const stop = () => {
+    stopped = true;
+    if (pollTimer) {
+      window.clearTimeout(pollTimer);
+      pollTimer = undefined;
+    }
+  };
+
+  const poll = async () => {
+    if (stopped) return;
+    attempts += 1;
+
+    try {
+      const polled = await window.electronAPI?.pollDesktopAuthToken?.();
+      if (polled?.ready) {
+        stop();
+        await completeElectronLoginFromToken(root);
+        return;
+      }
+
+      const token = await window.electronAPI?.getSecureAuthToken?.();
+      if (token) {
+        const user = await loadCurrentUser().catch(() => null);
+        if (user) {
+          stop();
+          await completeElectronLoginFromToken(root);
+          return;
+        }
+      }
+    } catch (error) {
+      console.warn('[Renderer Auth] desktop login poll failed =', error);
+    }
+
+    if (attempts >= maxAttempts) {
+      stop();
+      showElectronLoginRetry(
+        root,
+        'Login completed in the browser but the desktop app did not reconnect automatically. Click Continue with Google to retry.',
+      );
+      return;
+    }
+
+    pollTimer = window.setTimeout(() => {
+      void poll();
+    }, 2000);
+  };
+
+  const onLoginComplete = () => {
+    stop();
+    void completeElectronLoginFromToken(root);
+  };
+
+  window.addEventListener('lerzo-login-complete', onLoginComplete);
+  pollTimer = window.setTimeout(() => {
+    void poll();
+  }, 2000);
+
+  return () => {
+    stop();
+    window.removeEventListener('lerzo-login-complete', onLoginComplete);
+  };
+}
+
 function installElectronLoginBridge(root: HTMLElement) {
   const button = root.querySelector<HTMLButtonElement>('#google-login-btn');
   const loading = root.querySelector<HTMLElement>('#auth-loading');
@@ -556,6 +655,7 @@ function installElectronLoginBridge(root: HTMLElement) {
   button.style.position = 'relative';
   button.style.zIndex = '5';
   button.dataset.electronLoginInstalled = 'true';
+  let stopAuthWatch: (() => void) | undefined;
 
   button.onclick = async (event) => {
     event.preventDefault();
@@ -568,6 +668,8 @@ function installElectronLoginBridge(root: HTMLElement) {
     try {
       await startElectronGoogleLogin();
       showLoginToast(root, 'Opening Google sign-in in your browser.');
+      stopAuthWatch?.();
+      stopAuthWatch = startDesktopAuthCompletionWatch(root);
     } catch (error) {
       button.disabled = false;
       if (loading) loading.style.display = 'none';

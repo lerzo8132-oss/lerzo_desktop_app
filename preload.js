@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return () => ipcRenderer.removeListener('auth-token-received', listener);
     },
     checkInternet: () => ipcRenderer.invoke('check-backend-health').then((result) => Boolean(result?.reachable)),
+    pollDesktopAuthToken: () => ipcRenderer.invoke('poll-desktop-auth-token'),
     retryLoad: () => ipcRenderer.send('retry-load'),
     clearAuthSession: () => ipcRenderer.invoke('clear-auth-session'),
     getSecureAuthToken: () => ipcRenderer.invoke('get-secure-auth-token'),

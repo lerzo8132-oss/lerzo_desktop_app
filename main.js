@@ -706,27 +706,90 @@ function showLoginAfterAuthFailure(message) {
 let authCallbackInFlight = null;
 let lastHandledAuthToken = null;
 
-async function handleAuthCallback(callbackUrl) {
-    console.log('[Electron Auth] deep link received =', callbackUrl ? callbackUrl.split('token=')[0] + 'token=<redacted>' : '(empty)');
-
+function parseDesktopAuthCallback(callbackUrl) {
     if (!callbackUrl || typeof callbackUrl !== 'string' || !callbackUrl.startsWith('lerzo://')) {
-        console.warn('[Electron Auth] token extracted = no (invalid callback URL)');
-        return false;
+        return null;
     }
 
     try {
         const parsed = new URL(callbackUrl);
-        if (parsed.hostname === 'auth' && parsed.pathname === '/register') {
-            const params = new URLSearchParams();
-            ['email', 'name', 'google_id'].forEach((key) => {
-                const value = parsed.searchParams.get(key);
-                if (value) params.set(key, value);
-            });
+        const host = String(parsed.hostname || '').toLowerCase();
+        const path = String(parsed.pathname || '').toLowerCase();
+
+        if (host === 'auth' && path === '/register') {
+            return { type: 'register', params: parsed.searchParams };
+        }
+
+        const token = parsed.searchParams.get('token');
+        const isAuthCallback =
+            (host === 'auth' && (path === '/callback' || path === '/success'))
+            || host === 'auth-success'
+            || host === 'callback'
+            || (host === 'auth' && (!path || path === '/'));
+
+        if (!isAuthCallback) {
+            return null;
+        }
+
+        return { type: 'auth', token };
+    } catch {
+        return null;
+    }
+}
+
+async function notifyRendererLoginComplete() {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        return;
+    }
+
+    mainWindow.webContents.send('auth-token-received');
+    await mainWindow.webContents.executeJavaScript(`
+        window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
+        window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
+        if (!window.location.hash.startsWith('#/dashboard')) {
+            window.location.hash = '#/dashboard';
+        }
+    `, true).catch(() => {});
+}
+
+async function completeDesktopLoginAfterAuth(token) {
+    if (!mainWindow && app.isReady()) {
+        createMainWindow();
+    }
+    if (!mainWindow) {
+        return false;
+    }
+
+    await notifyRendererLoginComplete();
+    startupLog('Desktop login completed', { tokenSaved: Boolean(token) });
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    return true;
+}
+
+async function handleAuthCallback(callbackUrl) {
+    console.log('[Electron Auth] deep link received =', callbackUrl ? callbackUrl.split('token=')[0] + 'token=<redacted>' : '(empty)');
+
+    const parsedCallback = parseDesktopAuthCallback(callbackUrl);
+    if (!parsedCallback) {
+        console.warn('[Electron Auth] token extracted = no (unsupported callback URL)');
+        return false;
+    }
+
+    try {
+        if (parsedCallback.type === 'register') {
+            const params = parsedCallback.params;
             if (!mainWindow && app.isReady()) {
                 createMainWindow();
             }
             if (!mainWindow) return false;
-            const hash = params.toString() ? `#/auth-register?${params.toString()}` : '#/auth-register';
+            const hashParams = new URLSearchParams();
+            ['email', 'name', 'google_id'].forEach((key) => {
+                const value = params.get(key);
+                if (value) hashParams.set(key, value);
+            });
+            const hash = hashParams.toString() ? `#/auth-register?${hashParams.toString()}` : '#/auth-register';
             navigateMainWindow(hash);
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
@@ -734,14 +797,7 @@ async function handleAuthCallback(callbackUrl) {
             return true;
         }
 
-        const isAuthCallback = parsed.hostname === 'auth' && parsed.pathname === '/callback';
-        const isLegacyCallback = parsed.hostname === 'callback';
-        if (!isAuthCallback && !isLegacyCallback) {
-            console.warn('[Electron Auth] token extracted = no (unsupported callback path)');
-            return false;
-        }
-
-        const token = parsed.searchParams.get('token');
+        const token = parsedCallback.token;
         console.log('[Electron Auth] token extracted =', token ? 'yes' : 'no');
         if (!token) return false;
         if (token === lastHandledAuthToken && authCallbackInFlight) {
@@ -762,21 +818,8 @@ async function handleAuthCallback(callbackUrl) {
 
                 console.log('[Electron Auth] calling /desktop-api/auth/me');
                 await verifyDesktopAuthToken(token);
-
-                if (!mainWindow && app.isReady()) {
-                    createMainWindow();
-                }
-                if (!mainWindow) {
-                    return false;
-                }
-
-                mainWindow.webContents.send('auth-token-received');
-                console.log('[Electron Auth] auth token dispatched to renderer');
-                if (mainWindow.isMinimized()) mainWindow.restore();
-                mainWindow.show();
-                mainWindow.focus();
                 lastHandledAuthToken = token;
-                return true;
+                return completeDesktopLoginAfterAuth(token);
             } finally {
                 authCallbackInFlight = null;
             }
@@ -984,6 +1027,7 @@ if (!gotSingleInstanceLock) {
     app.quit();
 } else {
     app.on('second-instance', (_event, argv) => {
+        startupLog('Second instance argv received', { argv });
         const callbackUrl = argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
         if (callbackUrl) {
             void handleAuthCallback(callbackUrl);
@@ -1108,6 +1152,25 @@ ipcMain.handle('check-backend-health', async () => {
         error: result.error || null,
     });
     return result;
+});
+
+ipcMain.handle('poll-desktop-auth-token', async () => {
+    const token = loadSecureAuthToken();
+    if (!token) {
+        return { ready: false };
+    }
+
+    try {
+        await verifyDesktopAuthToken(token);
+        lastHandledAuthToken = token;
+        await completeDesktopLoginAfterAuth(token);
+        return { ready: true };
+    } catch (error) {
+        return {
+            ready: false,
+            error: error && error.message ? error.message : String(error),
+        };
+    }
 });
 
 ipcMain.handle('get-secure-auth-token', async () => loadSecureAuthToken());
