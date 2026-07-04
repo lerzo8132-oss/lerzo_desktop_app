@@ -1,5 +1,5 @@
-import { copyFileSync, existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 
 const expectedUrl = 'https://app.lerzo.com';
 const sourcePath = resolve('config/api-config.production.json');
@@ -19,5 +19,14 @@ if (!existsSync(winIconSource)) {
 }
 copyFileSync(winIconSource, winIconTarget);
 
+const logoSource = resolve('assets/LOGO.png');
+const logoTarget = resolve('public/static/images/lezo-logo.png');
+if (!existsSync(logoSource)) {
+  throw new Error('Missing assets/LOGO.png (required for renderer boot logo).');
+}
+mkdirSync(dirname(logoTarget), { recursive: true });
+copyFileSync(logoSource, logoTarget);
+
 console.log(`[API CONFIG] production config prepared: ${expectedUrl}`);
 console.log(`[BUILD] Windows icon ready: ${winIconTarget}`);
+console.log(`[BUILD] Renderer logo ready: ${logoTarget}`);

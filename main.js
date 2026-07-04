@@ -61,8 +61,28 @@ let apiMonitorState = {
 };
 
 const IS_PROD = app.isPackaged;
+const ELECTRON_DEBUG = ['1', 'true', 'yes'].includes(String(process.env.LERZO_ELECTRON_DEBUG || '').trim().toLowerCase());
 const RENDERER_DEV_URL = (process.env.ELECTRON_RENDERER_URL || `http://${['127', '0', '0', '1'].join('.')}:5173`).replace(/\/$/, '');
+const SPLASH_FALLBACK_MS = 15000;
 let API_CONFIG = null;
+let splashFallbackTimer = null;
+
+function getLogFilePath() {
+    return path.join(app.getPath('userData'), 'logs', 'main.log');
+}
+
+function startupLog(message, details) {
+    const suffix = details ? ` ${JSON.stringify(details)}` : '';
+    const line = `[${new Date().toISOString()}] ${message}${suffix}`;
+    console.log(line);
+    try {
+        const logDir = path.dirname(getLogFilePath());
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.appendFileSync(getLogFilePath(), `${line}\n`);
+    } catch {
+        // Logging must never block startup.
+    }
+}
 
 function getApiConfig() {
     if (!API_CONFIG) {
@@ -126,18 +146,73 @@ function resolveAppIcon() {
 
 const APP_ICON = resolveAppIcon();
 
+function normalizeRouteHash(hash = '') {
+    if (!hash) return '';
+    const value = hash.startsWith('#') ? hash.slice(1) : hash;
+    return value.startsWith('/') ? value : `/${value}`;
+}
+
+function getRendererIndexPath() {
+    const candidates = [
+        path.join(app.getAppPath(), 'dist', 'index.html'),
+        path.join(__dirname, 'dist', 'index.html')
+    ];
+    return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
+
 function getElectronStartUrl(hash = '') {
     const normalizedHash = hash ? (hash.startsWith('#') ? hash : `#${hash}`) : '';
     if (!IS_PROD) {
         return `${RENDERER_DEV_URL}${normalizedHash}`;
     }
 
-    const indexFile = path.join(__dirname, 'dist/index.html');
+    const indexFile = getRendererIndexPath();
     if (fs.existsSync(indexFile)) {
         return `${pathToFileURL(indexFile).toString()}${normalizedHash}`;
     }
 
     throw new Error(`Packaged renderer is missing: ${indexFile}`);
+}
+
+function closeSplashWindow() {
+    if (splashFallbackTimer) {
+        clearTimeout(splashFallbackTimer);
+        splashFallbackTimer = null;
+    }
+    if (splashWindow && !splashWindow.isDestroyed()) {
+        splashWindow.close();
+        splashWindow = null;
+    }
+}
+
+function scheduleSplashFallback() {
+    if (splashFallbackTimer) {
+        clearTimeout(splashFallbackTimer);
+    }
+    splashFallbackTimer = setTimeout(() => {
+        startupLog('Splash fallback timeout reached; showing main window');
+        closeSplashWindow();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show();
+            if (ELECTRON_DEBUG) {
+                mainWindow.webContents.openDevTools({ mode: 'detach' });
+            }
+        }
+    }, SPLASH_FALLBACK_MS);
+}
+
+function recordLoadFailure(error, target) {
+    const message = error && error.message ? error.message : String(error);
+    startupLog('Renderer load failed', { target, message });
+    apiMonitorState.errors.unshift({
+        timestamp: new Date().toISOString(),
+        type: 'electron',
+        message: `Load failed: ${message}`,
+        endpoint: target || '',
+        page: ''
+    });
+    apiMonitorState.errors = apiMonitorState.errors.slice(0, 100);
+    closeSplashWindow();
 }
 
 function getPersistSession() {
@@ -511,7 +586,11 @@ function createSplashWindow() {
                 contextIsolation: true
             }
         });
-        splashWindow.loadFile(path.join(__dirname, 'splash/splash.html')).catch(() => {});
+        const splashPath = path.join(app.getAppPath(), 'splash', 'splash.html');
+        splashWindow.loadFile(splashPath).catch((error) => {
+            startupLog('Splash load failed', { splashPath, message: error?.message || String(error) });
+        });
+        scheduleSplashFallback();
     } catch {
         splashWindow = null;
     }
@@ -519,16 +598,36 @@ function createSplashWindow() {
 
 function navigateMainWindow(hash = '') {
     if (!mainWindow) return;
-    mainWindow.loadURL(getElectronStartUrl(hash)).catch((error) => {
-        apiMonitorState.errors.unshift({
-            timestamp: new Date().toISOString(),
-            type: 'electron',
-            message: `Load failed: ${error.message || String(error)}`,
-            endpoint: getElectronStartUrl(hash),
-            page: ''
-        });
-        apiMonitorState.errors = apiMonitorState.errors.slice(0, 100);
+
+    if (!IS_PROD) {
+        const targetUrl = getElectronStartUrl(hash);
+        startupLog('Loading renderer (dev)', { targetUrl });
+        mainWindow.loadURL(targetUrl).catch((error) => recordLoadFailure(error, targetUrl));
+        return;
+    }
+
+    const indexPath = getRendererIndexPath();
+    const routeHash = normalizeRouteHash(hash);
+    startupLog('Loading renderer (prod)', {
+        indexPath,
+        routeHash,
+        exists: fs.existsSync(indexPath),
+        appPath: app.getAppPath(),
+        dirname: __dirname,
+        resourcesPath: process.resourcesPath
     });
+
+    if (!fs.existsSync(indexPath)) {
+        recordLoadFailure(new Error(`Packaged renderer is missing: ${indexPath}`), indexPath);
+        const offlinePath = path.join(app.getAppPath(), 'offline', 'offline.html');
+        if (fs.existsSync(offlinePath)) {
+            mainWindow.loadFile(offlinePath).catch((error) => recordLoadFailure(error, offlinePath));
+        }
+        return;
+    }
+
+    const loadOptions = routeHash ? { hash: routeHash } : undefined;
+    mainWindow.loadFile(indexPath, loadOptions).catch((error) => recordLoadFailure(error, indexPath));
 }
 
 async function navigateRendererHash(hash = '#/dashboard') {
@@ -650,9 +749,7 @@ async function handleAuthCallback(callbackUrl) {
             }
             if (!mainWindow) return false;
             const hash = params.toString() ? `#/auth-register?${params.toString()}` : '#/auth-register';
-            mainWindow.loadURL(getElectronStartUrl(hash)).catch((error) => {
-                console.error('[Electron Auth] failed to open registration page:', error);
-            });
+            navigateMainWindow(hash);
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
@@ -736,7 +833,7 @@ function createMainWindow() {
             nodeIntegration: false,
             contextIsolation: true,
             sandbox: true,
-            devTools: !IS_PROD,
+            devTools: !IS_PROD || ELECTRON_DEBUG,
             partition: 'persist:lerzo'
         }
     });
@@ -749,19 +846,32 @@ function createMainWindow() {
     const initialHash = loadSecureAuthToken() ? '#/dashboard' : '#/auth-login';
     navigateMainWindow(initialHash);
 
-    if (!IS_PROD) {
-        mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-            const prefix = level === 3 ? '[Renderer Error]' : '[Renderer]';
-            console.log(`${prefix} ${message}${sourceId ? ` (${sourceId}:${line})` : ''}`);
-        });
-    }
+    mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+        if (!ELECTRON_DEBUG && IS_PROD && level !== 3) return;
+        const prefix = level === 3 ? '[Renderer Error]' : '[Renderer]';
+        const rendered = `${prefix} ${message}${sourceId ? ` (${sourceId}:${line})` : ''}`;
+        console.log(rendered);
+        if (IS_PROD && level === 3) {
+            startupLog(rendered);
+        }
+    });
+
+    mainWindow.webContents.on('did-finish-load', () => {
+        startupLog('Renderer did-finish-load', { url: mainWindow.webContents.getURL() });
+    });
 
     // Handle failure to load
-    mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-        // If the URL that failed wasn't the offline page itself, load the offline page
-        const offlinePath = path.join(__dirname, 'offline/offline.html');
+    mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) return;
+        const offlinePath = path.join(app.getAppPath(), 'offline', 'offline.html');
+        startupLog('Renderer did-fail-load', {
+            errorCode,
+            errorDescription,
+            validatedURL,
+            offlinePath
+        });
+        closeSplashWindow();
         if (validatedURL !== offlinePath && !validatedURL.includes('offline/offline.html')) {
-            console.log(`❌ Page failed to load: ${validatedURL} (${errorDescription}). Loading offline screen.`);
             apiMonitorState.errors.unshift({
                 timestamp: new Date().toISOString(),
                 type: 'electron',
@@ -770,7 +880,11 @@ function createMainWindow() {
                 page: ''
             });
             apiMonitorState.errors = apiMonitorState.errors.slice(0, 100);
-            mainWindow.loadFile(offlinePath);
+            if (fs.existsSync(offlinePath)) {
+                mainWindow.loadFile(offlinePath).catch((error) => recordLoadFailure(error, offlinePath));
+            } else if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.show();
+            }
         }
     });
 
@@ -823,8 +937,12 @@ function createMainWindow() {
     }
 
     mainWindow.once('ready-to-show', () => {
-        if (splashWindow) splashWindow.close();
+        startupLog('Main window ready-to-show');
+        closeSplashWindow();
         mainWindow.show();
+        if (ELECTRON_DEBUG) {
+            mainWindow.webContents.openDevTools({ mode: 'detach' });
+        }
         autoUpdater.checkForUpdatesAndNotify();
     });
 
@@ -891,6 +1009,19 @@ app.on('open-url', (event, url) => {
 
 if (gotSingleInstanceLock) {
     app.whenReady().then(() => {
+        const indexPath = getRendererIndexPath();
+        startupLog('Lerzo startup', {
+            isPackaged: app.isPackaged,
+            electronDebug: ELECTRON_DEBUG,
+            appPath: app.getAppPath(),
+            dirname: __dirname,
+            resourcesPath: process.resourcesPath,
+            userData: app.getPath('userData'),
+            logFile: getLogFilePath(),
+            indexPath,
+            indexExists: fs.existsSync(indexPath)
+        });
+
         getApiConfig();
         const { healthUrl, googleLoginUrl } = getApiConfig();
         console.log(`[Lerzo] Desktop health check endpoint: ${healthUrl}`);

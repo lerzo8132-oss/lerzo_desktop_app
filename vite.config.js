@@ -5,6 +5,8 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    // Avoid crossorigin module tags that break file:// loads in packaged Electron.
+    modulePreload: false,
   },
   server: {
     host: '127.0.0.1',

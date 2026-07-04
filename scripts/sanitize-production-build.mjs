@@ -34,6 +34,10 @@ for (const filePath of files) {
   for (const [pattern, replacement] of replacements) {
     contents = contents.replace(pattern, replacement);
   }
+  if (filePath.endsWith('.html')) {
+    // Module scripts with crossorigin fail under Electron file:// loads.
+    contents = contents.replace(/\s+crossorigin(?:="[^"]*")?/g, '');
+  }
   if (contents !== original) {
     writeFileSync(filePath, contents);
   }
