@@ -13,6 +13,7 @@ jobs:
     env:
       VITE_API_BASE_URL: https://app.lerzo.com
       VITE_APP_ENV: production
+      CSC_IDENTITY_AUTO_DISCOVERY: false
 
     steps:
       - name: Checkout
@@ -26,14 +27,28 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build renderer
-        run: npm run build
+      - name: Prepare production config
+        run: npm run prepare:prod-config
 
-      - name: Verify renderer files
+      - name: Build renderer only
+        run: npm run vite:build
+
+      - name: Sanitize production build
+        run: npm run sanitize:prod-build
+
+      - name: Verify required files
         shell: pwsh
         run: |
           if (!(Test-Path "dist/index.html")) {
-            Write-Error "ERROR: dist/index.html missing. Renderer build not included."
+            Write-Error "dist/index.html missing"
+            exit 1
+          }
+          if (!(Test-Path "splash/splash.html")) {
+            Write-Error "splash/splash.html missing"
+            exit 1
+          }
+          if (!(Test-Path "offline/offline.html")) {
+            Write-Error "offline/offline.html missing"
             exit 1
           }
 
