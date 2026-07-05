@@ -12,16 +12,38 @@ contextBridge.exposeInMainWorld('electronAPI', {
         loginWithGoogle: () => ipcRenderer.invoke('auth-login-with-google'),
     },
     onUpdateAvailable: (callback) => ipcRenderer.on('update-available', callback),
+    // Reliable desktop-login notification. The main process pushes
+    // `auth-token-received` over IPC the instant it authenticates; we expose two
+    // named subscriptions (auth-token / login-complete) that both ride this same
+    // reliable channel so the renderer is notified regardless of which it uses.
     onAuthTokenReceived: (callback) => {
         const listener = () => {
-            console.info('[Renderer Auth] token received');
-            console.info('[Renderer Auth] login callback received');
+            console.info('[Renderer Auth] IPC auth-token-received received');
             callback();
         };
         ipcRenderer.on('auth-token-received', listener);
         return () => ipcRenderer.removeListener('auth-token-received', listener);
     },
-    ackDesktopLogin: () => ipcRenderer.send('auth-renderer-ack'),
+    onLoginComplete: (callback) => {
+        const listener = () => {
+            console.info('[Renderer Auth] IPC login-complete received');
+            callback();
+        };
+        ipcRenderer.on('auth-token-received', listener);
+        return () => ipcRenderer.removeListener('auth-token-received', listener);
+    },
+    ackDesktopLogin: () => {
+        console.info('[Renderer Auth] ackDesktopLogin -> main');
+        ipcRenderer.send('auth-renderer-ack');
+    },
+    onAuthLoginFailed: (callback) => {
+        const listener = (_event, reason) => {
+            console.warn('[Renderer Auth] login failed =', reason);
+            callback(reason);
+        };
+        ipcRenderer.on('auth-login-failed', listener);
+        return () => ipcRenderer.removeListener('auth-login-failed', listener);
+    },
     checkInternet: () => ipcRenderer.invoke('check-backend-health').then((result) => Boolean(result?.reachable)),
     getConnectivityStatus: () => ipcRenderer.invoke('get-connectivity-status'),
     pollDesktopAuthToken: () => ipcRenderer.invoke('poll-desktop-auth-token'),

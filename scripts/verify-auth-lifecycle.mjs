@@ -156,11 +156,16 @@ assertMatch(
   'handleAuthCallback rejects already-consumed nonces',
 );
 
-// 15. Login IPC attaches the state nonce to the OAuth URL
+// 15. Login IPC attaches desktop=1 and the state nonce to the OAuth URL
 assertMatch(
   'main.js',
-  /beginLoginTransaction\(\)[\s\S]*?appendQueryParam\([\s\S]*?'state', nonce\)/,
-  'login IPC attaches state nonce to OAuth URL',
+  /function buildDesktopLoginUrl\(baseUrl, nonce\)[\s\S]*?appendQueryParam\(baseUrl, 'desktop', '1'\)[\s\S]*?appendQueryParam\(target, 'state', nonce\)/,
+  'buildDesktopLoginUrl attaches desktop=1 and state nonce',
+);
+assertMatch(
+  'main.js',
+  /beginLoginTransaction\(\);\s*\n\s*const targetUrl = buildDesktopLoginUrl\(/,
+  'login IPC builds desktop login URL with state nonce',
 );
 
 // 16. Startup ignores deep links unless a login is pending
@@ -239,8 +244,123 @@ assertMatch(
 );
 assertMatch(
   'preload.js',
-  /ackDesktopLogin:\s*\(\)\s*=>\s*ipcRenderer\.send\('auth-renderer-ack'\)/,
+  /ackDesktopLogin:\s*\(\)\s*=>[\s\S]*?ipcRenderer\.send\('auth-renderer-ack'\)/,
   'preload exposes ackDesktopLogin',
+);
+
+// --- Exact reject reasons + verify-before-save + no auto-logout ---
+
+// 25. Exact reject reason vocabulary is present
+['no_active_login_request', 'missing_state', 'state_mismatch', 'token_missing', 'token_verify_failed'].forEach((reason) => {
+  assertMatch('main.js', new RegExp(`reason:\\s*'${reason}'`), `reject reason logged: ${reason}`);
+});
+
+// 26. Token is verified BEFORE it is persisted (no accidental session overwrite)
+assertMatch(
+  'main.js',
+  /await verifyDesktopAuthToken\(token\);[\s\S]*?const tokenSaved = saveSecureAuthToken\(token\)/,
+  'handleAuthCallback verifies token before saving it',
+);
+
+// 27. No auto-logout: an existing valid session is preserved on a failed login
+assertMatch(
+  'main.js',
+  /const hadExistingSession = Boolean\(loadSecureAuthToken\(\)\)[\s\S]*?if \(!hadExistingSession\)[\s\S]*?clearSecureAuthToken\(\)/,
+  'failed login does not clear a pre-existing session',
+);
+
+// 28. Main pushes an immediate failure signal to the renderer
+assertMatch(
+  'main.js',
+  /function notifyRendererLoginFailed\(reason\)[\s\S]*?send\('auth-login-failed', reason\)/,
+  'main notifies renderer of login failure via IPC',
+);
+assertMatch(
+  'main.js',
+  /notifyRendererLoginFailed\('token_verify_failed'\)/,
+  'token verify failure notifies the renderer',
+);
+
+// 29. Renderer reacts to the failure signal (retry + button reset), bounded wait
+assertMatch(
+  'preload.js',
+  /onAuthLoginFailed:\s*\(callback\)[\s\S]*?ipcRenderer\.on\('auth-login-failed'/,
+  'preload exposes onAuthLoginFailed',
+);
+assertMatch(
+  'src/components/TemplateHtmlPage.tsx',
+  /onAuthLoginFailed\?\.\(\(reason\) => failWithRetry\(reason\)\)/,
+  'login watch resets on main-process failure signal',
+);
+assertMatch(
+  'src/components/TemplateHtmlPage.tsx',
+  /const maxAttempts = 12/,
+  'login watch has a bounded (non-infinite) timeout',
+);
+
+// --- Web side: desktop=1 recognition + robust state capture ---
+
+// 30. Backend recognizes desktop=1 and captures state via helper
+assertMatch(
+  '../lerzo_web-main/routes/auth.py',
+  /request\.args\.get\('desktop'\) == '1'/,
+  'backend recognizes desktop=1 electron requests',
+);
+assertMatch(
+  '../lerzo_web-main/routes/auth.py',
+  /def _capture_electron_state\(\)[\s\S]*?session\['electron_state'\] = state/,
+  'backend has a reusable state-capture helper',
+);
+
+// --- Renderer IPC listener reliability (desktop login notification) ---
+
+// 31. preload exposes both named subscriptions + ack
+assertMatch('preload.js', /onAuthTokenReceived:\s*\(callback\)/, 'preload exposes onAuthTokenReceived');
+assertMatch('preload.js', /onLoginComplete:\s*\(callback\)/, 'preload exposes onLoginComplete');
+
+// 32. Listeners are registered in a mount-only effect (empty deps) so they are
+//     never torn down by unrelated state/dependency changes before a callback.
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /desktop-login listeners registered[\s\S]*?\n\s*\}, \[\]\);/,
+  'auth IPC listeners registered once (mount-only effect)',
+);
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /onAuthTokenReceived\?\.\(onDesktopLogin\)[\s\S]*?onLoginComplete\?\.\(onDesktopLogin\)/,
+  'renderer subscribes to both onAuthTokenReceived and onLoginComplete',
+);
+
+// 33. refreshUser supports force (bypasses in-flight de-dup for login callback)
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /if \(options\?\.force\)\s*\{[\s\S]*?refreshInFlight\.current = null/,
+  'refreshUser supports force option',
+);
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /refreshUser\(\{ silent: true, force: true \}\)/,
+  'login callback forces a fresh refreshUser',
+);
+
+// 34. Required structured renderer logs are present
+[
+  '\\[Renderer Auth\\] IPC auth-token-received received',
+  '\\[Renderer Auth\\] refreshUser success',
+  '\\[Renderer Auth\\] navigating dashboard',
+  '\\[Renderer Auth\\] dashboard mounted, ack sent',
+].forEach((log) => {
+  const inCtx = new RegExp(log).test(read('src/context/AuthContext.tsx'));
+  const inPreload = new RegExp(log).test(read('preload.js'));
+  if (inCtx || inPreload) pass(`renderer log present: ${log}`);
+  else fail(`renderer log missing: ${log}`);
+});
+
+// 35. AppRoutes never redirects to /auth-login while a desktop login completes
+assertMatch(
+  'src/App.tsx',
+  /if \(!isAuthenticated && !isPublicPath && !loginCompleting\)/,
+  'AppRoutes suppresses /auth-login redirect while loginCompleting',
 );
 
 console.log('\n=== Electron Auth Lifecycle Verification ===\n');

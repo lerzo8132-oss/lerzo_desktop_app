@@ -24,10 +24,27 @@ interface AuthContextValue {
   authError: string | null;
   refreshUser: () => Promise<boolean>;
   handleLoginCallback: () => Promise<boolean>;
+  notifyDashboardMounted: () => void;
   logout: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+
+// Survives a full renderer reload (e.g. main's force-refresh watchdog) so the
+// ack still fires once the dashboard mounts after re-bootstrapping auth.
+const DESKTOP_LOGIN_PENDING_KEY = 'lerzo_desktop_login_pending';
+
+function markDesktopLoginPending() {
+  try { sessionStorage.setItem(DESKTOP_LOGIN_PENDING_KEY, '1'); } catch { /* ignore */ }
+}
+
+function clearDesktopLoginPending() {
+  try { sessionStorage.removeItem(DESKTOP_LOGIN_PENDING_KEY); } catch { /* ignore */ }
+}
+
+function isDesktopLoginPending(): boolean {
+  try { return sessionStorage.getItem(DESKTOP_LOGIN_PENDING_KEY) === '1'; } catch { return false; }
+}
 
 function readCachedUser(): CurrentUser | null {
   try {
@@ -50,6 +67,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const loginNavigatePending = useRef(false);
   const refreshInFlight = useRef<Promise<boolean> | null>(null);
   const authChecked = useRef(false);
+  // True while a desktop login is completing and we still owe main an ack once
+  // the dashboard has actually mounted.
+  const pendingDashboardAck = useRef(isDesktopLoginPending());
+  // Stable handles so the once-registered IPC listeners always call the latest
+  // logic without needing the listener effect to re-run (and re-subscribe).
+  const handleLoginCallbackRef = useRef<() => Promise<boolean>>(async () => false);
+  const refreshUserRef = useRef<(options?: { silent?: boolean; timeoutMs?: number; force?: boolean }) => Promise<boolean>>(async () => false);
 
   const finishBoot = useCallback((reason: string) => {
     setLoading(false);
@@ -58,7 +82,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     markBootComplete(reason);
   }, []);
 
-  const refreshUser = useCallback(async (options?: { silent?: boolean; timeoutMs?: number }) => {
+  const refreshUser = useCallback(async (options?: { silent?: boolean; timeoutMs?: number; force?: boolean }) => {
+    // `force` bypasses in-flight de-dup so a desktop-login callback always runs a
+    // fresh verification even if a boot/idle refresh is still pending.
+    if (options?.force) {
+      refreshInFlight.current = null;
+    }
     if (refreshInFlight.current) {
       return refreshInFlight.current;
     }
@@ -148,28 +177,46 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return false;
     }
 
+    // Desktop login is an intermediate state: keep the loader up and defer any
+    // routing decision (never bounce to /auth-login) until refreshUser resolves.
     callbackInFlight.current = true;
+    pendingDashboardAck.current = true;
+    markDesktopLoginPending();
     setLoginCompleting(true);
     resetAuthTokenCache();
     refreshInFlight.current = null;
 
     try {
-      const ok = await refreshUser({ silent: true });
+      // Immediately verify the just-saved token and load the user. No polling.
+      const ok = await refreshUser({ silent: true, force: true });
       if (ok) {
+        console.log('[Renderer Auth] refreshUser success');
+        // user/authenticated are now set; the effect below navigates to the
+        // dashboard. The ack is sent only after the dashboard actually mounts.
         loginNavigatePending.current = true;
         return true;
       }
 
-      window.location.hash = '#/auth-error?message=Login%20verification%20failed.%20Please%20try%20again.';
+      // Genuine verification failure — leave the login screen usable so the user
+      // (or main's auth-login-failed signal) can retry. Do NOT keep completing.
+      callbackInFlight.current = false;
+      pendingDashboardAck.current = false;
+      clearDesktopLoginPending();
+      setLoginCompleting(false);
       return false;
-    } finally {
-      if (!loginNavigatePending.current) {
-        callbackInFlight.current = false;
-        setLoginCompleting(false);
-      }
+    } catch (error) {
+      console.error('[Renderer Auth] desktop login callback failed =', error);
+      callbackInFlight.current = false;
+      pendingDashboardAck.current = false;
+      clearDesktopLoginPending();
+      setLoginCompleting(false);
+      return false;
     }
   }, [refreshUser]);
 
+  // Navigate to the dashboard the instant the user is loaded. We keep
+  // loginCompleting true here so AppRoutes renders the dashboard (authenticated)
+  // rather than redirecting; the ack is deferred until the dashboard mounts.
   useEffect(() => {
     if (!loginNavigatePending.current || !user) {
       return;
@@ -177,14 +224,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     loginNavigatePending.current = false;
     callbackInFlight.current = false;
+    console.log('[Renderer Auth] navigating dashboard');
     if (window.location.hash !== '#/dashboard') {
       window.location.hash = '#/dashboard';
     }
-    setLoginCompleting(false);
-    // Tell the main process we successfully refreshed auth + navigated so it can
-    // cancel the force-refresh watchdog. Never leave main waiting for a restart.
-    window.electronAPI?.ackDesktopLogin?.();
   }, [user]);
+
+  // Called once the dashboard route has mounted. This is the ONLY place that
+  // acknowledges the desktop login to the main process (never before), which
+  // cancels main's force-refresh watchdog. Always runs when a login is pending.
+  const notifyDashboardMounted = useCallback(() => {
+    if (!pendingDashboardAck.current) {
+      if (loginCompleting) setLoginCompleting(false);
+      return;
+    }
+    pendingDashboardAck.current = false;
+    clearDesktopLoginPending();
+    setLoginCompleting(false);
+    window.electronAPI?.ackDesktopLogin?.();
+    console.log('[Renderer Auth] dashboard mounted, ack sent');
+  }, [loginCompleting]);
 
   const logout = useCallback(async () => {
     stopNotificationPoller();
@@ -198,52 +257,89 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // Keep the stable refs pointing at the latest callbacks every render so the
+  // once-registered listeners never call stale logic.
+  handleLoginCallbackRef.current = handleLoginCallback;
+  refreshUserRef.current = refreshUser;
+
+  // Boot bootstrap ONLY — no listeners here, so its dependency changes can never
+  // tear down the auth IPC listeners.
   useEffect(() => {
     if (authChecked.current) return undefined;
     authChecked.current = true;
 
     let cancelled = false;
+    // If a desktop login was in progress when main force-reloaded the renderer,
+    // keep the "Signing you in..." loader up while we re-bootstrap auth so we
+    // never flash the login screen mid-login.
+    if (pendingDashboardAck.current) {
+      setLoginCompleting(true);
+    }
     const safetyTimer = window.setTimeout(() => {
       if (cancelled) return;
       finishBoot('timeout');
     }, BOOT_MAX_LOADER_MS);
 
     void (async () => {
+      let bootOk = false;
       try {
-        await refreshUser({ silent: false, timeoutMs: AUTH_CHECK_TIMEOUT_MS });
+        // Auth token already present -> bootstrap immediately (no extra polling).
+        bootOk = await refreshUser({ silent: false, timeoutMs: AUTH_CHECK_TIMEOUT_MS });
       } catch (error) {
         console.warn('[BOOT] auth bootstrap failed =', error);
       } finally {
-        if (cancelled) return;
-        window.clearTimeout(safetyTimer);
-        finishBoot('complete');
+        if (!cancelled) {
+          // A pending desktop login that could not be verified on boot must not
+          // leave the loader stuck; release it so routing can proceed.
+          if (pendingDashboardAck.current && !bootOk) {
+            pendingDashboardAck.current = false;
+            clearDesktopLoginPending();
+            setLoginCompleting(false);
+          }
+          window.clearTimeout(safetyTimer);
+          finishBoot('complete');
+        }
       }
     })();
 
-    const handleAuthChanged = () => {
-      if (callbackInFlight.current) return;
-      void refreshUser({ silent: true });
-    };
-
-    const unsubscribeAuthToken = window.electronAPI?.onAuthTokenReceived?.(() => {
-      void handleLoginCallback();
-    });
-
-    const handleLoginComplete = () => {
-      if (callbackInFlight.current) return;
-      void handleLoginCallback();
-    };
-
-    window.addEventListener('lerzo-auth-changed', handleAuthChanged as EventListener);
-    window.addEventListener('lerzo-login-complete', handleLoginComplete as EventListener);
     return () => {
       cancelled = true;
       window.clearTimeout(safetyTimer);
-      window.removeEventListener('lerzo-auth-changed', handleAuthChanged as EventListener);
-      window.removeEventListener('lerzo-login-complete', handleLoginComplete as EventListener);
-      unsubscribeAuthToken?.();
     };
-  }, [finishBoot, handleLoginCallback, refreshUser]);
+  }, [finishBoot, refreshUser]);
+
+  // Desktop-login IPC + DOM listeners. Registered exactly ONCE on mount and torn
+  // down ONLY on unmount (empty deps) so a callback can never arrive after the
+  // listener was removed. On a full renderer/Vite reload the provider remounts,
+  // so this re-registers automatically.
+  useEffect(() => {
+    const onDesktopLogin = () => {
+      console.log('[Renderer Auth] IPC auth-token-received received');
+      void handleLoginCallbackRef.current();
+    };
+    const onDomLoginComplete = () => {
+      if (callbackInFlight.current) return;
+      console.log('[Renderer Auth] DOM lerzo-login-complete received');
+      void handleLoginCallbackRef.current();
+    };
+    const onAuthChanged = () => {
+      if (callbackInFlight.current) return;
+      void refreshUserRef.current({ silent: true });
+    };
+
+    const unsubscribeAuthToken = window.electronAPI?.onAuthTokenReceived?.(onDesktopLogin);
+    const unsubscribeLoginComplete = window.electronAPI?.onLoginComplete?.(onDesktopLogin);
+    window.addEventListener('lerzo-login-complete', onDomLoginComplete as EventListener);
+    window.addEventListener('lerzo-auth-changed', onAuthChanged as EventListener);
+    console.log('[Renderer Auth] desktop-login listeners registered');
+
+    return () => {
+      unsubscribeAuthToken?.();
+      unsubscribeLoginComplete?.();
+      window.removeEventListener('lerzo-login-complete', onDomLoginComplete as EventListener);
+      window.removeEventListener('lerzo-auth-changed', onAuthChanged as EventListener);
+    };
+  }, []);
 
   const value = useMemo<AuthContextValue>(() => ({
     user,
@@ -255,8 +351,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     authError,
     refreshUser: () => refreshUser({ silent: Boolean(user) }),
     handleLoginCallback,
+    notifyDashboardMounted,
     logout,
-  }), [authError, bootReady, handleLoginCallback, loading, loginCompleting, logout, refreshUser, refreshing, user]);
+  }), [authError, bootReady, handleLoginCallback, loading, loginCompleting, logout, notifyDashboardMounted, refreshUser, refreshing, user]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

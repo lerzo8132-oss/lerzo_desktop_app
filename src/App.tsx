@@ -108,6 +108,16 @@ function SettingsNavGroup() {
 }
 
 const DashboardComponent = templatePages.find((page) => page.path === '/dashboard')?.component;
+
+// Renders the dashboard and, once mounted, acknowledges a completing desktop
+// login to the main process (only ever after the dashboard is on screen).
+function DashboardRoute() {
+  const { notifyDashboardMounted } = useAuth();
+  useEffect(() => {
+    notifyDashboardMounted();
+  }, [notifyDashboardMounted]);
+  return DashboardComponent ? <DashboardComponent /> : <DashboardLoadErrorPage />;
+}
 const userFacingTemplatePages = templatePages.filter((page) => (
   page.path !== '/dashboard' &&
   page.path !== '/settings-developer_tools' &&
@@ -221,7 +231,10 @@ function AppRoutes() {
     return null;
   }
 
-  if (loginCompleting) {
+  // Desktop login is an intermediate state: while it completes and we are not yet
+  // authenticated, hold the loader and make NO routing decision (never bounce to
+  // /auth-login). Once authenticated, fall through so the dashboard can render.
+  if (loginCompleting && !isAuthenticated) {
     return <LoadingScreen message="Signing you in..." />;
   }
 
@@ -230,7 +243,7 @@ function AppRoutes() {
     return <Navigate to={`/auth-error?message=${message}`} replace />;
   }
 
-  if (!isAuthenticated && !isPublicPath) {
+  if (!isAuthenticated && !isPublicPath && !loginCompleting) {
     const next = encodeURIComponent(location.pathname + location.search);
     return <Navigate to={`/auth-login?next=${next}`} replace />;
   }
@@ -246,8 +259,8 @@ function AppRoutes() {
           <Route path="/" element={<Navigate to={isAuthenticated ? defaultPagePath : '/auth-login'} replace />} />
           <Route path="/server-down" element={<ServerDownPage />} />
           <Route path="/auth-error" element={<AuthErrorPage />} />
-          <Route path="/dashboard" element={DashboardComponent ? <DashboardComponent /> : <DashboardLoadErrorPage />} />
-          <Route path="/c/:unique_id/dashboard" element={DashboardComponent ? <DashboardComponent /> : <DashboardLoadErrorPage />} />
+          <Route path="/dashboard" element={<DashboardRoute />} />
+          <Route path="/c/:unique_id/dashboard" element={<DashboardRoute />} />
           <Route path="/whatsapp-dashboard" element={<WhatsAppPage page="dashboard" />} />
           <Route path="/whatsapp-contacts" element={<WhatsAppPage page="contacts" />} />
           <Route path="/whatsapp-templates" element={<WhatsAppPage page="templates" />} />

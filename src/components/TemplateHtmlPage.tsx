@@ -545,8 +545,11 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
   let stopped = false;
   let completed = false;
   let attempts = 0;
-  const maxAttempts = 30;
+  // ~24s of polling (12 * 2s) before giving up; the main process also pushes an
+  // immediate failure signal, so this is only a backstop for a lost callback.
+  const maxAttempts = 12;
   let pollTimer: number | undefined;
+  let unsubscribeFailed: (() => void) | undefined;
 
   // Removing the listener here (before any completion work) is critical: the
   // completion path dispatches 'lerzo-login-complete' again to notify the auth
@@ -559,6 +562,24 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
       pollTimer = undefined;
     }
     window.removeEventListener('lerzo-login-complete', onLoginComplete);
+    window.removeEventListener('lerzo-login-failed', onLoginFailed as EventListener);
+    unsubscribeFailed?.();
+    unsubscribeFailed = undefined;
+  };
+
+  const failWithRetry = (reason?: string) => {
+    if (completed || stopped) return;
+    stop();
+    console.warn('[Renderer Auth] desktop login failed =', reason || 'unknown');
+    showElectronLoginRetry(
+      root,
+      'We could not complete sign-in. Please click "Continue with Google" to try again.',
+    );
+  };
+
+  const onLoginFailed = (event: Event) => {
+    const detail = (event as CustomEvent<string>).detail;
+    failWithRetry(detail);
   };
 
   const finish = async () => {
@@ -591,11 +612,7 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
     if (stopped) return;
 
     if (attempts >= maxAttempts) {
-      stop();
-      showElectronLoginRetry(
-        root,
-        'Login completed in the browser but the desktop app did not reconnect automatically. Click Continue with Google to retry.',
-      );
+      failWithRetry('poll_timeout');
       return;
     }
 
@@ -609,6 +626,8 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
   };
 
   window.addEventListener('lerzo-login-complete', onLoginComplete);
+  window.addEventListener('lerzo-login-failed', onLoginFailed as EventListener);
+  unsubscribeFailed = window.electronAPI?.onAuthLoginFailed?.((reason) => failWithRetry(reason));
   pollTimer = window.setTimeout(() => {
     void poll();
   }, 2000);

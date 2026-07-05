@@ -80,6 +80,10 @@ async function main() {
     ['GUARD: reject callback with no active login', /PROBE_GUARD_NO_ACTIVE pass/],
     ['GUARD: reject state mismatch (pending survives)', /PROBE_GUARD_STATE_MISMATCH pass/],
     ['GUARD: reject callback with missing state', /PROBE_GUARD_MISSING_STATE pass/],
+    // End-to-end accept path against a local mock /me (no external network).
+    ['ITEM 8: existing session survives a failed login (no auto-logout)', /PROBE_NO_AUTOLOGOUT pass/],
+    ['ITEM 4+5: second-instance callback accepted + authenticated', /PROBE_SECOND_INSTANCE_ACCEPTED pass/],
+    ['ITEM 6: renderer notified immediately on login', /PROBE_RENDERER_NOTIFIED pass/],
   ];
 
   if (tokenPath) {

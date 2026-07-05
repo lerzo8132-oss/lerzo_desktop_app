@@ -477,10 +477,81 @@ async function runAuthLifecycleProbe() {
     guard = await handleAuthCallback('lerzo://auth-success?token=faketok', 'probe-missing-state');
     authProbeLog(`PROBE_GUARD_MISSING_STATE ${guard === false && !loadSecureAuthToken() ? 'pass' : 'fail'}`);
 
-    // Reset before the real-token flow.
+    // Reset before the accept-path flow.
     clearPendingLogin();
     consumedNonces.clear();
     setLoginState(LOGIN_STATE.IDLE, { reason: 'probe_reset_2' });
+
+    // ---------------------------------------------------------------
+    // End-to-end accept-path tests against a LOCAL mock /me (no network).
+    // Covers: second-instance receipt (item 4), callback acceptance (item 5),
+    // immediate renderer notification (item 6), and no-auto-logout (item 8).
+    // ---------------------------------------------------------------
+    try {
+        const http = require('http');
+        let meStatus = 200;
+        const mockServer = http.createServer((req, res) => {
+            if (req.url && req.url.startsWith('/me')) {
+                res.writeHead(meStatus, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(meStatus === 200 ? { user: { id: 1, email: 'probe@lerzo.test' } } : { error: 'invalid' }));
+                return;
+            }
+            res.writeHead(404);
+            res.end();
+        });
+        await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+        const mockMeUrl = `http://127.0.0.1:${mockServer.address().port}/me`;
+        const realConfig = getApiConfig();
+        const realMeUrl = realConfig.meUrl;
+        realConfig.meUrl = mockMeUrl;
+
+        // Item 6 groundwork: capture the immediate renderer notification.
+        await mainWindow.webContents.executeJavaScript(`
+            window.__probeNotified = false;
+            if (window.electronAPI && window.electronAPI.onAuthTokenReceived) {
+                window.electronAPI.onAuthTokenReceived(function () { window.__probeNotified = true; });
+            }
+            true;
+        `, true).catch(() => {});
+
+        // Item 8: an existing valid session must survive a FAILED new login.
+        saveSecureAuthToken('EXISTING_SESSION_TOKEN');
+        meStatus = 401;
+        const failNonce = beginLoginTransaction();
+        await handleAuthCallback(`lerzo://auth-success?token=NEWBADTOKEN&state=${failNonce}`, 'second-instance');
+        const sessionPreserved = loadSecureAuthToken() === 'EXISTING_SESSION_TOKEN';
+        authProbeLog(`PROBE_NO_AUTOLOGOUT ${sessionPreserved ? 'pass' : 'fail'}`);
+
+        // Item 4 + 5: a matching-state callback arriving via the second-instance
+        // path (Windows deep link) is ACCEPTED and authenticates.
+        clearSecureAuthToken();
+        clearPendingLogin();
+        consumedNonces.clear();
+        setLoginState(LOGIN_STATE.IDLE, { reason: 'probe_e2e_reset' });
+        meStatus = 200;
+        const okNonce = beginLoginTransaction();
+        const okUrl = `lerzo://auth-success?token=GOODTOKEN123&state=${okNonce}`;
+        const accepted = await handleAuthCallback(okUrl, 'second-instance');
+        const acceptOk = accepted !== false
+            && loginState === LOGIN_STATE.AUTHENTICATED
+            && loadSecureAuthToken() === 'GOODTOKEN123';
+        authProbeLog(`PROBE_SECOND_INSTANCE_ACCEPTED ${acceptOk ? 'pass' : 'fail'}`);
+
+        // Item 6: the renderer received the immediate login-complete notification.
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        const notified = await mainWindow.webContents.executeJavaScript('Boolean(window.__probeNotified)', true).catch(() => false);
+        authProbeLog(`PROBE_RENDERER_NOTIFIED ${notified ? 'pass' : 'fail'}`);
+
+        // Restore + cleanup.
+        realConfig.meUrl = realMeUrl;
+        mockServer.close();
+        clearSecureAuthToken();
+        clearPendingLogin();
+        consumedNonces.clear();
+        setLoginState(LOGIN_STATE.IDLE, { reason: 'probe_e2e_done' });
+    } catch (error) {
+        authProbeLog(`PROBE_E2E_ERROR ${error && error.message ? error.message : String(error)}`);
+    }
 
     if (!existingToken) {
         authProbeLog('PROBE_NO_TOKEN_SKIP_FULL_FLOW');
@@ -1125,6 +1196,15 @@ function appendQueryParam(url, key, value) {
     }
 }
 
+// Build the browser login URL for a desktop login transaction. It always carries
+// desktop=1 (so the backend treats it as an Electron flow) and the single-use
+// state nonce (so the deep link can be tied back to this exact request).
+function buildDesktopLoginUrl(baseUrl, nonce) {
+    let target = appendQueryParam(baseUrl, 'desktop', '1');
+    target = appendQueryParam(target, 'state', nonce);
+    return target;
+}
+
 function parseDesktopAuthCallback(callbackUrl) {
     if (!callbackUrl || typeof callbackUrl !== 'string' || !callbackUrl.startsWith('lerzo://')) {
         return null;
@@ -1208,6 +1288,25 @@ function armRendererAckWatchdog() {
     }, RENDERER_ACK_TIMEOUT_MS);
 }
 
+// Tell the renderer a login attempt it is actively waiting on has failed so it
+// leaves "Authenticating...", shows a retry message and re-enables the button —
+// instead of polling until its own timeout.
+function notifyRendererLoginFailed(reason) {
+    clearRendererAckTimer();
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        return;
+    }
+    authLog('RENDERER_LOGIN_FAILED_NOTIFIED', { reason });
+    mainWindow.webContents.send('auth-login-failed', reason);
+    mainWindow.webContents.executeJavaScript(
+        `window.dispatchEvent(new CustomEvent('lerzo-login-failed', { detail: ${JSON.stringify(String(reason || 'login_failed'))} }));`,
+        true,
+    ).catch(() => {});
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+}
+
 async function notifyRendererLoginComplete() {
     if (!mainWindow || mainWindow.isDestroyed()) {
         return;
@@ -1288,18 +1387,28 @@ async function handleAuthCallback(callbackUrl, source = 'unknown') {
         return false;
     }
     if (!token) {
-        authLog('CALLBACK_REJECTED', { source, reason: 'missing_token' });
+        // The user's own login came back without a token — surface a fast retry.
+        authLog('CALLBACK_REJECTED', { source, reason: 'token_missing' });
+        notifyRendererLoginFailed('token_missing');
         return false;
     }
     if (!state) {
+        // Almost always the backend did not echo the state nonce (e.g. an older
+        // server build). This is the user's active attempt failing — fast retry.
         authLog('CALLBACK_REJECTED', { source, reason: 'missing_state' });
+        notifyRendererLoginFailed('missing_state');
         return false;
     }
     if (consumedNonces.has(state)) {
+        // A replay of an already-used callback (stale tab / duplicate delivery):
+        // the real login already succeeded or was handled — do NOT disturb it.
         authLog('CALLBACK_REJECTED', { source, reason: 'replay_consumed', state: redactNonce(state) });
         return false;
     }
     if (state !== pendingLogin.nonce) {
+        // A callback from a DIFFERENT (older) login attempt. The real callback for
+        // the current attempt may still be arriving, so keep waiting — do not
+        // consume the pending login and do not prematurely reset the renderer.
         authLog('CALLBACK_REJECTED', {
             source,
             reason: 'state_mismatch',
@@ -1322,24 +1431,32 @@ async function handleAuthCallback(callbackUrl, source = 'unknown') {
     authLog('CALLBACK_ACCEPTED', { source, state: redactNonce(state) });
 
     authCallbackInFlight = (async () => {
+        const hadExistingSession = Boolean(loadSecureAuthToken());
         try {
+            // Verify BEFORE persisting so a bad/unreachable token can never
+            // overwrite or wipe an existing valid session (no accidental logout).
+            await verifyDesktopAuthToken(token);
+
             const tokenSaved = saveSecureAuthToken(token);
             authLog('JWT_SAVED', { ok: Boolean(tokenSaved) });
             if (!tokenSaved) {
                 throw new Error('Unable to save desktop auth token');
             }
 
-            await verifyDesktopAuthToken(token);
             lastHandledAuthToken = token;
             setLoginState(LOGIN_STATE.AUTHENTICATED, { source });
             authLog('AUTHENTICATED', { source });
             return await completeDesktopLoginAfterAuth(token);
         } catch (error) {
             const message = error && error.message ? error.message : String(error);
-            authLog('AUTH_FAILED', { source, message });
-            clearSecureAuthToken();
-            setLoginState(LOGIN_STATE.LOGGED_OUT, { reason: 'verify_failed' });
-            showLoginAfterAuthFailure('Login could not be completed. Please try again.');
+            authLog('CALLBACK_REJECTED', { source, reason: 'token_verify_failed', message });
+            // Do NOT auto-logout: only the failed *new* token is discarded, and
+            // only if there was no pre-existing session to protect.
+            if (!hadExistingSession) {
+                clearSecureAuthToken();
+            }
+            setLoginState(hadExistingSession ? LOGIN_STATE.AUTHENTICATED : LOGIN_STATE.IDLE, { reason: 'token_verify_failed' });
+            notifyRendererLoginFailed('token_verify_failed');
             return false;
         } finally {
             authCallbackInFlight = null;
@@ -1547,17 +1664,18 @@ if (!gotSingleInstanceLock) {
 } else {
     app.on('second-instance', (_event, argv) => {
         startupLog('Second instance argv received', { argv });
-        const callbackUrl = argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
-        if (callbackUrl) {
-            void handleAuthCallback(callbackUrl, 'second-instance');
-            return;
-        }
+        // The user clicked "Return to desktop app": always surface the existing
+        // window so it visibly receives the callback (Windows deep-link path).
         if (mainWindow && !mainWindow.isDestroyed()) {
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
         } else if (app.isReady()) {
             createMainWindow();
+        }
+        const callbackUrl = argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
+        if (callbackUrl) {
+            void handleAuthCallback(callbackUrl, 'second-instance');
         }
     });
 }
@@ -1669,8 +1787,8 @@ ipcMain.handle('start-google-login', async (_event, url) => {
     // pre-check never leaves a dangling pending login.
     await assertBackendAvailableForLogin(config);
     const nonce = beginLoginTransaction();
-    const targetUrl = appendQueryParam(baseUrl, 'state', nonce);
-    authLog('OAUTH_OPENED', {});
+    const targetUrl = buildDesktopLoginUrl(baseUrl, nonce);
+    authLog('OAUTH_OPENED', { url: targetUrl.split('state=')[0] + 'state=<redacted>' });
     await shell.openExternal(targetUrl);
     return true;
 });
@@ -1684,8 +1802,8 @@ ipcMain.handle('auth-login-with-google', async () => {
     }
     await assertBackendAvailableForLogin(config);
     const nonce = beginLoginTransaction();
-    const targetUrl = appendQueryParam(config.googleLoginUrl, 'state', nonce);
-    authLog('OAUTH_OPENED', {});
+    const targetUrl = buildDesktopLoginUrl(config.googleLoginUrl, nonce);
+    authLog('OAUTH_OPENED', { url: targetUrl.split('state=')[0] + 'state=<redacted>' });
     await shell.openExternal(targetUrl);
     return true;
 });

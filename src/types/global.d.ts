@@ -44,7 +44,9 @@ interface Window {
       consumedCount: number;
     }>;
     onAuthTokenReceived?: (callback: () => void) => () => void;
+    onLoginComplete?: (callback: () => void) => () => void;
     ackDesktopLogin?: () => void;
+    onAuthLoginFailed?: (callback: (reason: string) => void) => () => void;
     recordApiEvent?: (payload: unknown) => Promise<boolean>;
     recordRuntimeError?: (payload: unknown) => Promise<boolean>;
     getApiMonitorSnapshot?: () => Promise<unknown>;
