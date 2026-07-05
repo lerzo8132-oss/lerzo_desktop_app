@@ -1,6 +1,7 @@
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, session, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, session, safeStorage, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 const { loadApiConfig, probeBackendHealth } = require('./config/loadApiConfig');
 
@@ -204,6 +205,87 @@ function recordLoadFailure(error, target) {
     closeSplashWindow();
 }
 
+let devRendererRetryAttempts = 0;
+const DEV_RENDERER_MAX_RETRIES = 40;
+const DEV_RENDERER_RETRY_DELAY_MS = 500;
+
+function resetDevRendererRetries() {
+    devRendererRetryAttempts = 0;
+}
+
+// In dev, the Vite server may not be listening yet when Electron boots. A failed
+// load of the dev URL is NOT an offline condition; retry until Vite is ready.
+function scheduleDevRendererRetry() {
+    if (IS_PROD) return false;
+    if (devRendererRetryAttempts >= DEV_RENDERER_MAX_RETRIES) return false;
+    devRendererRetryAttempts += 1;
+    startupLog('Dev renderer retry scheduled', {
+        attempt: devRendererRetryAttempts,
+        max: DEV_RENDERER_MAX_RETRIES,
+    });
+    setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
+        }
+    }, DEV_RENDERER_RETRY_DELAY_MS);
+    return true;
+}
+
+// Distinguish the three failure modes so we never show "No Internet" when the
+// network is actually fine.
+//   - 'network'  : device has no internet at all
+//   - 'server'   : internet is up but the Lerzo backend is unreachable
+//   - 'renderer' : internet + backend are fine, the app content failed to load
+async function classifyConnectivity() {
+    let hasInternet = true;
+    try {
+        hasInternet = net.isOnline();
+    } catch {
+        hasInternet = true;
+    }
+
+    let backendReachable = false;
+    try {
+        const config = getApiConfig();
+        const result = await probeBackendHealth(config, { timeoutMs: 5000 });
+        backendReachable = Boolean(result && result.reachable);
+    } catch {
+        backendReachable = false;
+    }
+
+    let reason = 'renderer';
+    if (!hasInternet && !backendReachable) {
+        reason = 'network';
+    } else if (!backendReachable) {
+        reason = 'server';
+    }
+
+    return { reason, internet: hasInternet, backend: backendReachable };
+}
+
+async function showConnectivityFallback(offlinePath, context = {}) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!fs.existsSync(offlinePath)) {
+        mainWindow.show();
+        return;
+    }
+
+    const status = await classifyConnectivity();
+    startupLog('Connectivity fallback', { ...context, ...status });
+
+    try {
+        await mainWindow.loadFile(offlinePath, {
+            query: {
+                reason: status.reason,
+                internet: status.internet ? '1' : '0',
+                backend: status.backend ? '1' : '0',
+            },
+        });
+    } catch (error) {
+        recordLoadFailure(error, offlinePath);
+    }
+}
+
 function getPersistSession() {
     return session.fromPartition('persist:lerzo');
 }
@@ -283,6 +365,199 @@ function clearSecureAuthToken() {
     } catch {
         return false;
     }
+}
+
+function authProbeLog(message) {
+    if (process.env.LERZO_AUTH_PROBE !== '1') return;
+    const logPath = process.env.LERZO_AUTH_PROBE_LOG;
+    if (!logPath) return;
+    try {
+        fs.appendFileSync(logPath, `${message}\n`);
+    } catch {
+        // ignore probe logging failures
+    }
+}
+
+async function runAuthLifecycleProbe() {
+    if (process.env.LERZO_AUTH_PROBE !== '1' || !mainWindow || mainWindow.isDestroyed()) {
+        return;
+    }
+
+    authProbeLog('PROBE_BOOT');
+
+    const waitForRenderer = async (timeoutMs = 12000) => {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            if (rendererLoadedOnce) return true;
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        return rendererLoadedOnce;
+    };
+
+    if (!(await waitForRenderer())) {
+        authProbeLog('PROBE_BOOT_TIMEOUT');
+        app.quit();
+        return;
+    }
+
+    authProbeLog('PROBE_AUTH_PROVIDER');
+
+    const existingToken = loadSecureAuthToken();
+
+    // ---- Watch recursion sub-test (no valid token required) ----
+    // Reproduces the exact renderer path that previously overflowed the stack:
+    // clicking "Continue with Google" starts the completion watch, then a
+    // 'lerzo-login-complete' event drives the watch's completion handler.
+    if (existingToken) {
+        clearSecureAuthToken();
+    }
+    navigateMainWindow('#/auth-login');
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    await mainWindow.webContents.executeJavaScript(`
+        (function () {
+            window.__probeErrors = [];
+            window.addEventListener('error', function (e) {
+                window.__probeErrors.push((e.error && e.error.message) ? e.error.message : String(e.message || ''));
+            });
+        })();
+        true;
+    `, true).catch(() => {});
+
+    const clicked = await mainWindow.webContents.executeJavaScript(`
+        (function () {
+            var btn = document.getElementById('google-login-btn');
+            if (btn) { btn.click(); return true; }
+            return false;
+        })();
+    `, true).catch(() => false);
+    authProbeLog(`PROBE_LOGIN_WATCH_STARTED clicked=${clicked ? 'yes' : 'no'}`);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    // Fire the completion event repeatedly to stress the watch for re-entrancy.
+    await mainWindow.webContents.executeJavaScript(`
+        (function () {
+            for (var i = 0; i < 3; i++) {
+                window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
+            }
+        })();
+        true;
+    `, true).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    const watchErrors = await mainWindow.webContents.executeJavaScript(
+        'JSON.stringify(window.__probeErrors || [])',
+        true,
+    ).catch(() => '[]');
+    if (/call stack size exceeded/i.test(watchErrors)) {
+        authProbeLog(`PROBE_WATCH_OVERFLOW ${watchErrors}`);
+    } else {
+        authProbeLog('PROBE_WATCH_NO_OVERFLOW');
+    }
+
+    // ---------------------------------------------------------------
+    // Transaction / replay guard tests (no valid token or network needed)
+    // ---------------------------------------------------------------
+    clearPendingLogin();
+    consumedNonces.clear();
+    setLoginState(LOGIN_STATE.IDLE, { reason: 'probe_reset' });
+    clearSecureAuthToken();
+
+    // 1) A callback with no active login request must be rejected outright.
+    let guard = await handleAuthCallback('lerzo://auth-success?token=faketok&state=deadbeefdeadbeef', 'probe-no-active');
+    authProbeLog(`PROBE_GUARD_NO_ACTIVE ${guard === false && !loadSecureAuthToken() ? 'pass' : 'fail'}`);
+
+    // 2) A callback whose state does not match the pending nonce is rejected,
+    //    and the pending login survives (still awaiting the real callback).
+    beginLoginTransaction();
+    guard = await handleAuthCallback('lerzo://auth-success?token=faketok&state=wrongstatewrongstate', 'probe-mismatch');
+    authProbeLog(`PROBE_GUARD_STATE_MISMATCH ${guard === false && !loadSecureAuthToken() && isPendingLoginActive() ? 'pass' : 'fail'}`);
+
+    // 3) A callback with no state at all is rejected.
+    guard = await handleAuthCallback('lerzo://auth-success?token=faketok', 'probe-missing-state');
+    authProbeLog(`PROBE_GUARD_MISSING_STATE ${guard === false && !loadSecureAuthToken() ? 'pass' : 'fail'}`);
+
+    // Reset before the real-token flow.
+    clearPendingLogin();
+    consumedNonces.clear();
+    setLoginState(LOGIN_STATE.IDLE, { reason: 'probe_reset_2' });
+
+    if (!existingToken) {
+        authProbeLog('PROBE_NO_TOKEN_SKIP_FULL_FLOW');
+        app.quit();
+        return;
+    }
+
+    authProbeLog('PROBE_CALLBACK');
+    const acceptNonce = beginLoginTransaction();
+    const callbackUrl = `lerzo://auth-success?token=${encodeURIComponent(existingToken)}&state=${acceptNonce}`;
+    await handleAuthCallback(callbackUrl, 'probe-accept');
+
+    // Replay of the exact same callback (stale tab / duplicate delivery) must be
+    // rejected now that the nonce is consumed and no login is pending.
+    const replay = await handleAuthCallback(callbackUrl, 'probe-replay');
+    authProbeLog(`PROBE_REPLAY_REJECTED ${replay === false ? 'pass' : 'fail'}`);
+
+    const deadline = Date.now() + 20000;
+    let dashboardReady = false;
+    while (Date.now() < deadline) {
+        const state = await mainWindow.webContents.executeJavaScript(`
+            ({
+                hash: window.location.hash || '',
+                hasUser: Boolean(localStorage.getItem('lerzo_user')),
+            })
+        `, true).catch(() => ({ hash: '', hasUser: false }));
+
+        authProbeLog(`PROBE_ROUTES hash=${state.hash || '(empty)'} user=${state.hasUser ? 'yes' : 'no'}`);
+        if (state.hash.includes('dashboard') && state.hasUser) {
+            dashboardReady = true;
+            break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    const probeErrors = await mainWindow.webContents.executeJavaScript(
+        'JSON.stringify(window.__probeErrors || [])',
+        true,
+    ).catch(() => '[]');
+    const overflow = /call stack size exceeded/i.test(probeErrors);
+    authProbeLog(overflow ? `PROBE_OVERFLOW ${probeErrors}` : 'PROBE_NO_OVERFLOW');
+
+    if (dashboardReady && !overflow) {
+        authProbeLog('PROBE_DASHBOARD');
+        const logoutState = await mainWindow.webContents.executeJavaScript(`
+            (async () => {
+                try {
+                    await window.electronAPI?.clearAuthSession?.();
+                } catch {}
+                window.location.hash = '#/auth-login';
+                localStorage.removeItem('lerzo_user');
+                return {
+                    hash: window.location.hash || '',
+                    hasUser: Boolean(localStorage.getItem('lerzo_user')),
+                };
+            })()
+        `, true).catch(() => ({ hash: '', hasUser: true }));
+
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        const logoutClean = (logoutState.hash || '').includes('auth-login')
+            && !logoutState.hasUser
+            && !loadSecureAuthToken()
+            && loginState === LOGIN_STATE.LOGGED_OUT
+            && !pendingLogin
+            && consumedNonces.size === 0;
+        authProbeLog(logoutClean ? 'PROBE_LOGOUT' : 'PROBE_LOGOUT_FAILED');
+
+        // After logout, a fresh login transaction must work again (logout -> login).
+        const reNonce = beginLoginTransaction();
+        const reLoginAccepted = loginState === LOGIN_STATE.WAITING_CALLBACK && isPendingLoginActive();
+        authProbeLog(`PROBE_RELOGIN_READY ${reLoginAccepted && reNonce ? 'pass' : 'fail'}`);
+        clearPendingLogin();
+    } else {
+        authProbeLog('PROBE_DASHBOARD_TIMEOUT');
+    }
+
+    app.quit();
 }
 
 function rememberEmail(email) {
@@ -662,6 +937,7 @@ async function verifyDesktopAuthToken(token) {
             }
         });
         console.log('[Electron Auth] /me status =', response.status);
+        authLog('ME_RESPONSE', { status: response.status });
         if (!response.ok) {
             throw new Error(`Desktop auth verification failed with ${response.status}`);
         }
@@ -706,6 +982,149 @@ function showLoginAfterAuthFailure(message) {
 let authCallbackInFlight = null;
 let lastHandledAuthToken = null;
 
+// ---------------------------------------------------------------------------
+// Production-safe login transaction + state machine
+// ---------------------------------------------------------------------------
+// Every login is a transaction bound to a single-use `state` nonce that is:
+//   1. generated the instant the user clicks "Continue with Google"
+//   2. attached to the OAuth request that opens in the browser
+//   3. echoed back inside the lerzo://auth-success deep link
+//   4. validated + consumed exactly once when the callback returns
+// A callback is ONLY accepted while the machine is WAITING_CALLBACK, its state
+// matches the pending nonce, and that nonce has not already been consumed.
+// This makes stale tabs, refreshes, back/forward, duplicate open-url /
+// second-instance / IPC / argv deliveries, and cached callbacks all inert.
+const LOGIN_STATE = Object.freeze({
+    IDLE: 'IDLE',
+    LOGIN_STARTED: 'LOGIN_STARTED',
+    WAITING_CALLBACK: 'WAITING_CALLBACK',
+    VERIFYING: 'VERIFYING',
+    AUTHENTICATED: 'AUTHENTICATED',
+    LOGGED_OUT: 'LOGGED_OUT',
+});
+
+const PENDING_LOGIN_FILE = path.join(app.getPath('userData'), 'pending-login.json');
+// A started login must be completed within this window (covers the Google popup
+// plus first-time registration). Persisting the pending transaction lets a
+// genuine login survive an app restart mid-flow while still expiring so it can
+// never become a permanent replay vector.
+const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
+
+let loginState = LOGIN_STATE.IDLE;
+let pendingLogin = null; // { nonce, createdAt, expiresAt }
+const consumedNonces = new Set();
+
+function redactNonce(nonce) {
+    if (!nonce || typeof nonce !== 'string') return '(none)';
+    return `${nonce.slice(0, 6)}…`;
+}
+
+function authLog(event, details) {
+    const suffix = details && Object.keys(details).length ? ` ${JSON.stringify(details)}` : '';
+    const line = `[AUTH] ${event}${suffix}`;
+    console.log(line);
+    try {
+        const logDir = path.dirname(getLogFilePath());
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.appendFileSync(getLogFilePath(), `[${new Date().toISOString()}] ${line}\n`);
+    } catch {
+        // Logging must never break auth.
+    }
+    authProbeLog(`AUTHLOG ${event}${suffix}`);
+}
+
+function setLoginState(next, details) {
+    if (loginState === next) return;
+    const prev = loginState;
+    loginState = next;
+    authLog('STATE', { from: prev, to: next, ...(details || {}) });
+}
+
+function getLoginStateSnapshot() {
+    return {
+        loginState,
+        pending: Boolean(pendingLogin),
+        pendingExpiresAt: pendingLogin ? pendingLogin.expiresAt : null,
+        consumedCount: consumedNonces.size,
+    };
+}
+
+function persistPendingLogin() {
+    try {
+        if (!pendingLogin) {
+            if (fs.existsSync(PENDING_LOGIN_FILE)) fs.unlinkSync(PENDING_LOGIN_FILE);
+            return;
+        }
+        const data = safeStorage.isEncryptionAvailable()
+            ? safeStorage.encryptString(JSON.stringify(pendingLogin))
+            : Buffer.from(JSON.stringify(pendingLogin), 'utf8');
+        fs.writeFileSync(PENDING_LOGIN_FILE, data);
+    } catch {
+        // Non-fatal: pending login simply won't survive a restart.
+    }
+}
+
+function loadPersistedPendingLogin() {
+    try {
+        if (!fs.existsSync(PENDING_LOGIN_FILE)) return null;
+        const raw = fs.readFileSync(PENDING_LOGIN_FILE);
+        const json = safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(raw) : raw.toString('utf8');
+        const data = JSON.parse(json);
+        if (!data || typeof data.nonce !== 'string' || typeof data.expiresAt !== 'number') return null;
+        if (Date.now() > data.expiresAt) {
+            fs.unlinkSync(PENDING_LOGIN_FILE);
+            return null;
+        }
+        return data;
+    } catch {
+        return null;
+    }
+}
+
+function clearPendingLogin() {
+    pendingLogin = null;
+    try {
+        if (fs.existsSync(PENDING_LOGIN_FILE)) fs.unlinkSync(PENDING_LOGIN_FILE);
+    } catch {
+        // ignore
+    }
+}
+
+function beginLoginTransaction() {
+    const nonce = crypto.randomBytes(24).toString('hex');
+    const now = Date.now();
+    pendingLogin = { nonce, createdAt: now, expiresAt: now + PENDING_LOGIN_TTL_MS };
+    persistPendingLogin();
+    setLoginState(LOGIN_STATE.WAITING_CALLBACK, { nonce: redactNonce(nonce) });
+    authLog('LOGIN_STARTED', { nonce: redactNonce(nonce), ttlMs: PENDING_LOGIN_TTL_MS });
+    return nonce;
+}
+
+function isPendingLoginActive() {
+    if (!pendingLogin) return false;
+    if (Date.now() > pendingLogin.expiresAt) {
+        authLog('PENDING_EXPIRED', { nonce: redactNonce(pendingLogin.nonce) });
+        clearPendingLogin();
+        if (loginState === LOGIN_STATE.WAITING_CALLBACK) {
+            setLoginState(loadSecureAuthToken() ? LOGIN_STATE.AUTHENTICATED : LOGIN_STATE.IDLE, { reason: 'pending_expired' });
+        }
+        return false;
+    }
+    return true;
+}
+
+function appendQueryParam(url, key, value) {
+    if (!url || !value) return url;
+    try {
+        const parsed = new URL(url);
+        parsed.searchParams.set(key, value);
+        return parsed.toString();
+    } catch {
+        const sep = url.includes('?') ? '&' : '?';
+        return `${url}${sep}${key}=${encodeURIComponent(value)}`;
+    }
+}
+
 function parseDesktopAuthCallback(callbackUrl) {
     if (!callbackUrl || typeof callbackUrl !== 'string' || !callbackUrl.startsWith('lerzo://')) {
         return null;
@@ -721,6 +1140,7 @@ function parseDesktopAuthCallback(callbackUrl) {
         }
 
         const token = parsed.searchParams.get('token');
+        const state = parsed.searchParams.get('state');
         const isAuthCallback =
             (host === 'auth' && (path === '/callback' || path === '/success'))
             || host === 'auth-success'
@@ -731,10 +1151,61 @@ function parseDesktopAuthCallback(callbackUrl) {
             return null;
         }
 
-        return { type: 'auth', token };
+        return { type: 'auth', token, state };
     } catch {
         return null;
     }
+}
+
+// After a callback is verified we push the login result to the renderer and wait
+// for it to acknowledge that it refreshed its auth state and left the
+// "Authenticating..." screen. If no ack arrives within this window the renderer
+// is force-refreshed (soft SPA reload) — never an application restart.
+const RENDERER_ACK_TIMEOUT_MS = 2000;
+let rendererAckTimer = null;
+
+function clearRendererAckTimer() {
+    if (rendererAckTimer) {
+        clearTimeout(rendererAckTimer);
+        rendererAckTimer = null;
+    }
+}
+
+async function forceRendererSessionRefresh(reason) {
+    clearRendererAckTimer();
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        return;
+    }
+
+    // If the renderer already made it to the dashboard we're done — the ack was
+    // simply slow/lost. Otherwise the renderer is stuck; reload the SPA. The JWT
+    // is already stored, so the auth bootstrap re-derives the session instantly
+    // without an application restart.
+    const state = await mainWindow.webContents.executeJavaScript(`
+        ({ hash: window.location.hash || '', hasUser: Boolean(localStorage.getItem('lerzo_user')) })
+    `, true).catch(() => ({ hash: '', hasUser: false }));
+
+    if (state.hash.includes('dashboard') && state.hasUser) {
+        authLog('RENDERER_REFRESH_SKIPPED_ALREADY_READY', { reason });
+        return;
+    }
+
+    authLog('RENDERER_REFRESH_FORCED', { reason, hash: state.hash || '(empty)' });
+    // Nudge the renderer first (cheap), then hard-reload it to the dashboard.
+    mainWindow.webContents.send('auth-token-received');
+    await mainWindow.webContents.executeJavaScript(`
+        window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
+        window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
+    `, true).catch(() => {});
+    navigateMainWindow('#/dashboard');
+}
+
+function armRendererAckWatchdog() {
+    clearRendererAckTimer();
+    rendererAckTimer = setTimeout(() => {
+        rendererAckTimer = null;
+        void forceRendererSessionRefresh('ack_timeout');
+    }, RENDERER_ACK_TIMEOUT_MS);
 }
 
 async function notifyRendererLoginComplete() {
@@ -742,11 +1213,14 @@ async function notifyRendererLoginComplete() {
         return;
     }
 
+    // Explicit IPC push so the renderer refreshes auth + navigates immediately.
     mainWindow.webContents.send('auth-token-received');
     await mainWindow.webContents.executeJavaScript(`
         window.dispatchEvent(new CustomEvent('lerzo-login-complete'));
         window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
     `, true).catch(() => {});
+    authLog('RENDERER_NOTIFIED', {});
+    armRendererAckWatchdog();
 }
 
 async function completeDesktopLoginAfterAuth(token) {
@@ -759,77 +1233,120 @@ async function completeDesktopLoginAfterAuth(token) {
 
     await notifyRendererLoginComplete();
     startupLog('Desktop login completed', { tokenSaved: Boolean(token) });
+    authLog('LOGIN_COMPLETE_NOTIFIED', {});
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
     return true;
 }
 
-async function handleAuthCallback(callbackUrl) {
-    console.log('[Electron Auth] deep link received =', callbackUrl ? callbackUrl.split('token=')[0] + 'token=<redacted>' : '(empty)');
-
+async function handleAuthCallback(callbackUrl, source = 'unknown') {
     const parsedCallback = parseDesktopAuthCallback(callbackUrl);
+    const redactedUrl = callbackUrl
+        ? callbackUrl.split('token=')[0].split('state=')[0] + (callbackUrl.includes('token=') ? 'token=<redacted>' : '')
+        : '(empty)';
+    authLog('CALLBACK_RECEIVED', { source, url: redactedUrl });
+
     if (!parsedCallback) {
-        console.warn('[Electron Auth] token extracted = no (unsupported callback URL)');
+        authLog('CALLBACK_REJECTED', { source, reason: 'unsupported_url' });
         return false;
     }
 
-    try {
-        if (parsedCallback.type === 'register') {
-            const params = parsedCallback.params;
-            if (!mainWindow && app.isReady()) {
-                createMainWindow();
-            }
-            if (!mainWindow) return false;
-            const hashParams = new URLSearchParams();
-            ['email', 'name', 'google_id'].forEach((key) => {
-                const value = params.get(key);
-                if (value) hashParams.set(key, value);
-            });
-            const hash = hashParams.toString() ? `#/auth-register?${hashParams.toString()}` : '#/auth-register';
-            navigateMainWindow(hash);
-            if (mainWindow.isMinimized()) mainWindow.restore();
-            mainWindow.show();
-            mainWindow.focus();
-            return true;
+    // Registration navigation is part of an in-progress login: only honor it
+    // while a transaction is genuinely pending (does NOT consume the nonce; the
+    // user still has to finish registration, which then emits auth-success).
+    if (parsedCallback.type === 'register') {
+        if (!isPendingLoginActive()) {
+            authLog('CALLBACK_REJECTED', { source, reason: 'register_without_active_login' });
+            return false;
         }
-
-        const token = parsedCallback.token;
-        console.log('[Electron Auth] token extracted =', token ? 'yes' : 'no');
-        if (!token) return false;
-        if (token === lastHandledAuthToken && authCallbackInFlight) {
-            console.log('[Electron Auth] duplicate callback ignored');
-            return true;
+        const params = parsedCallback.params;
+        if (!mainWindow && app.isReady()) {
+            createMainWindow();
         }
-        if (authCallbackInFlight) {
-            return authCallbackInFlight;
-        }
+        if (!mainWindow) return false;
+        const hashParams = new URLSearchParams();
+        ['email', 'name', 'google_id'].forEach((key) => {
+            const value = params.get(key);
+            if (value) hashParams.set(key, value);
+        });
+        const hash = hashParams.toString() ? `#/auth-register?${hashParams.toString()}` : '#/auth-register';
+        navigateMainWindow(hash);
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+        authLog('REGISTER_NAV', { source });
+        return true;
+    }
 
-        authCallbackInFlight = (async () => {
-            try {
-                const tokenSaved = saveSecureAuthToken(token);
-                console.log('[Electron Auth] token saved =', tokenSaved ? 'yes' : 'no');
-                if (!tokenSaved) {
-                    throw new Error('Unable to save desktop auth token');
-                }
+    const token = parsedCallback.token;
+    const state = parsedCallback.state;
 
-                console.log('[Electron Auth] calling /desktop-api/auth/me');
-                await verifyDesktopAuthToken(token);
-                lastHandledAuthToken = token;
-                return completeDesktopLoginAfterAuth(token);
-            } finally {
-                authCallbackInFlight = null;
-            }
-        })();
-
+    // ---- Transaction + replay guards (reject anything not tied to an active login) ----
+    if (!isPendingLoginActive() || loginState !== LOGIN_STATE.WAITING_CALLBACK) {
+        authLog('CALLBACK_REJECTED', { source, reason: 'no_active_login_request', loginState });
+        return false;
+    }
+    if (!token) {
+        authLog('CALLBACK_REJECTED', { source, reason: 'missing_token' });
+        return false;
+    }
+    if (!state) {
+        authLog('CALLBACK_REJECTED', { source, reason: 'missing_state' });
+        return false;
+    }
+    if (consumedNonces.has(state)) {
+        authLog('CALLBACK_REJECTED', { source, reason: 'replay_consumed', state: redactNonce(state) });
+        return false;
+    }
+    if (state !== pendingLogin.nonce) {
+        authLog('CALLBACK_REJECTED', {
+            source,
+            reason: 'state_mismatch',
+            expected: redactNonce(pendingLogin.nonce),
+            got: redactNonce(state),
+        });
+        return false;
+    }
+    if (authCallbackInFlight) {
+        authLog('CALLBACK_REJECTED', { source, reason: 'callback_in_flight' });
         return authCallbackInFlight;
-    } catch (error) {
-        authCallbackInFlight = null;
-        const message = error && error.message ? error.message : String(error);
-        console.error('[Electron Auth] callback error =', message);
-        showLoginAfterAuthFailure('Login could not be completed. Please try again.');
-        return false;
     }
+
+    // Passed every check — consume the nonce IMMEDIATELY so the exact same
+    // callback (stale tab, duplicate open-url, second-instance, refresh, etc.)
+    // can never be accepted a second time.
+    consumedNonces.add(state);
+    clearPendingLogin();
+    setLoginState(LOGIN_STATE.VERIFYING, { source });
+    authLog('CALLBACK_ACCEPTED', { source, state: redactNonce(state) });
+
+    authCallbackInFlight = (async () => {
+        try {
+            const tokenSaved = saveSecureAuthToken(token);
+            authLog('JWT_SAVED', { ok: Boolean(tokenSaved) });
+            if (!tokenSaved) {
+                throw new Error('Unable to save desktop auth token');
+            }
+
+            await verifyDesktopAuthToken(token);
+            lastHandledAuthToken = token;
+            setLoginState(LOGIN_STATE.AUTHENTICATED, { source });
+            authLog('AUTHENTICATED', { source });
+            return await completeDesktopLoginAfterAuth(token);
+        } catch (error) {
+            const message = error && error.message ? error.message : String(error);
+            authLog('AUTH_FAILED', { source, message });
+            clearSecureAuthToken();
+            setLoginState(LOGIN_STATE.LOGGED_OUT, { reason: 'verify_failed' });
+            showLoginAfterAuthFailure('Login could not be completed. Please try again.');
+            return false;
+        } finally {
+            authCallbackInFlight = null;
+        }
+    })();
+
+    return authCallbackInFlight;
 }
 
 function createMainWindow() {
@@ -879,6 +1396,7 @@ function createMainWindow() {
         startupLog('Renderer did-finish-load', { url });
         if (url.includes('index.html') || url.includes('/dist/') || url.startsWith(RENDERER_DEV_URL)) {
             rendererLoadedOnce = true;
+            resetDevRendererRetries();
         }
     });
 
@@ -896,6 +1414,9 @@ function createMainWindow() {
             return;
         }
         const offlinePath = path.join(app.getAppPath(), 'offline', 'offline.html');
+        if (validatedURL === offlinePath || validatedURL.includes('offline/offline.html')) {
+            return;
+        }
         startupLog('Renderer did-fail-load', {
             errorCode,
             errorDescription,
@@ -904,21 +1425,22 @@ function createMainWindow() {
             rendererLoadedOnce,
         });
         closeSplashWindow();
-        if (validatedURL !== offlinePath && !validatedURL.includes('offline/offline.html')) {
-            apiMonitorState.errors.unshift({
-                timestamp: new Date().toISOString(),
-                type: 'electron',
-                message: `Load failed: ${errorDescription}`,
-                endpoint: validatedURL,
-                page: ''
-            });
-            apiMonitorState.errors = apiMonitorState.errors.slice(0, 100);
-            if (fs.existsSync(offlinePath)) {
-                mainWindow.loadFile(offlinePath).catch((error) => recordLoadFailure(error, offlinePath));
-            } else if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.show();
-            }
+        apiMonitorState.errors.unshift({
+            timestamp: new Date().toISOString(),
+            type: 'electron',
+            message: `Load failed: ${errorDescription}`,
+            endpoint: validatedURL,
+            page: ''
+        });
+        apiMonitorState.errors = apiMonitorState.errors.slice(0, 100);
+
+        // Dev: Vite server may still be starting; silently retry instead of
+        // flashing a misleading offline screen.
+        if (!IS_PROD && validatedURL.startsWith(RENDERER_DEV_URL) && scheduleDevRendererRetry()) {
+            return;
         }
+
+        void showConnectivityFallback(offlinePath, { errorCode, errorDescription, validatedURL });
     });
 
     mainWindow.webContents.on('render-process-gone', (_event, details) => {
@@ -1027,18 +1549,22 @@ if (!gotSingleInstanceLock) {
         startupLog('Second instance argv received', { argv });
         const callbackUrl = argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
         if (callbackUrl) {
-            void handleAuthCallback(callbackUrl);
-        } else if (mainWindow) {
+            void handleAuthCallback(callbackUrl, 'second-instance');
+            return;
+        }
+        if (mainWindow && !mainWindow.isDestroyed()) {
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
+        } else if (app.isReady()) {
+            createMainWindow();
         }
     });
 }
 
 app.on('open-url', (event, url) => {
     event.preventDefault();
-    void handleAuthCallback(url);
+    void handleAuthCallback(url, 'open-url');
 });
 
 if (gotSingleInstanceLock) {
@@ -1058,6 +1584,17 @@ if (gotSingleInstanceLock) {
 
         getApiConfig();
         const config = getApiConfig();
+
+        // Startup auth restores ONLY from a valid stored JWT. A persisted pending
+        // login (a genuine login that was interrupted by a restart) may still be
+        // completed within its TTL; anything else means deep links are ignored.
+        pendingLogin = loadPersistedPendingLogin();
+        if (pendingLogin) {
+            setLoginState(LOGIN_STATE.WAITING_CALLBACK, { restored: true, nonce: redactNonce(pendingLogin.nonce) });
+        } else if (loadSecureAuthToken()) {
+            setLoginState(LOGIN_STATE.AUTHENTICATED, { restoredFromStoredJwt: true });
+        }
+
         const { healthUrl, googleLoginUrl } = config;
         startupLog('API config loaded for startup', {
             apiBaseUrl: config.apiBaseUrl,
@@ -1078,9 +1615,19 @@ if (gotSingleInstanceLock) {
         createSplashWindow();
         createMainWindow();
 
+        if (process.env.LERZO_AUTH_PROBE === '1') {
+            setTimeout(() => {
+                void runAuthLifecycleProbe();
+            }, 2500);
+        }
+
         const pendingCallbackUrl = process.argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
         if (pendingCallbackUrl) {
-            void handleAuthCallback(pendingCallbackUrl);
+            if (isPendingLoginActive()) {
+                void handleAuthCallback(pendingCallbackUrl, 'argv');
+            } else {
+                authLog('CALLBACK_REJECTED', { source: 'argv', reason: 'no_active_login_request_at_startup' });
+            }
         }
         
         // Set Dock Icon for Mac
@@ -1112,16 +1659,34 @@ ipcMain.on('open-external', (event, url) => shell.openExternal(url));
 
 ipcMain.handle('start-google-login', async (_event, url) => {
     const config = getApiConfig();
-    const targetUrl = typeof url === 'string' && url.startsWith('http') ? url : config.googleLoginUrl;
+    const baseUrl = typeof url === 'string' && url.startsWith('http') ? url : config.googleLoginUrl;
+    if (process.env.LERZO_AUTH_PROBE === '1') {
+        beginLoginTransaction(); // probe drives the deep link directly; don't open a real browser
+        authLog('OAUTH_OPENED', { probe: true });
+        return true;
+    }
+    // Only open a transaction once the backend is confirmed reachable so a failed
+    // pre-check never leaves a dangling pending login.
     await assertBackendAvailableForLogin(config);
+    const nonce = beginLoginTransaction();
+    const targetUrl = appendQueryParam(baseUrl, 'state', nonce);
+    authLog('OAUTH_OPENED', {});
     await shell.openExternal(targetUrl);
     return true;
 });
 
 ipcMain.handle('auth-login-with-google', async () => {
     const config = getApiConfig();
+    if (process.env.LERZO_AUTH_PROBE === '1') {
+        beginLoginTransaction(); // probe drives the deep link directly; don't open a real browser
+        authLog('OAUTH_OPENED', { probe: true });
+        return true;
+    }
     await assertBackendAvailableForLogin(config);
-    await shell.openExternal(config.googleLoginUrl);
+    const nonce = beginLoginTransaction();
+    const targetUrl = appendQueryParam(config.googleLoginUrl, 'state', nonce);
+    authLog('OAUTH_OPENED', {});
+    await shell.openExternal(targetUrl);
     return true;
 });
 
@@ -1152,6 +1717,9 @@ ipcMain.handle('check-backend-health', async () => {
 });
 
 ipcMain.handle('poll-desktop-auth-token', async () => {
+    // A token can only exist on disk after a callback passed the transaction
+    // guards (or a prior authenticated session). This is a renderer-side backup
+    // to the push notification; it never authenticates an un-consumed callback.
     const token = loadSecureAuthToken();
     if (!token) {
         return { ready: false };
@@ -1160,6 +1728,9 @@ ipcMain.handle('poll-desktop-auth-token', async () => {
     try {
         await verifyDesktopAuthToken(token);
         lastHandledAuthToken = token;
+        if (loginState !== LOGIN_STATE.AUTHENTICATED) {
+            setLoginState(LOGIN_STATE.AUTHENTICATED, { source: 'poll' });
+        }
         await completeDesktopLoginAfterAuth(token);
         return { ready: true };
     } catch (error) {
@@ -1178,19 +1749,57 @@ ipcMain.handle('clear-secure-auth-token', async () => clearSecureAuthToken());
 
 ipcMain.on('retry-load', () => {
     console.log('Retry requested. Reloading target URL.');
+    resetDevRendererRetries();
     if (mainWindow) {
-        navigateMainWindow();
+        navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
     }
 });
 
+ipcMain.handle('get-connectivity-status', async () => classifyConnectivity());
+
 ipcMain.handle('clear-auth-session', async () => {
+    authLog('LOGOUT_STARTED', {});
+    // Wipe every persisted auth artifact + reset the in-memory transaction state.
     clearSecureAuthToken();
-    const ses = getPersistSession();
-    await ses.clearStorageData({
-        storages: ['cookies', 'localstorage', 'sessionstorage', 'caches'],
-        quotas: ['temporary', 'persistent', 'syncable']
-    });
+    clearPendingLogin();
+    consumedNonces.clear();
+    lastHandledAuthToken = null;
+    authCallbackInFlight = null;
+    setLoginState(LOGIN_STATE.LOGGED_OUT, {});
+
+    const storages = [
+        'cookies',
+        'localstorage',
+        'sessionstorage',
+        'indexdb',
+        'websql',
+        'serviceworkers',
+        'cachestorage',
+        'shadercache',
+        'filesystem',
+    ];
+    const targets = [getPersistSession(), session.defaultSession];
+    for (const ses of targets) {
+        try {
+            await ses.clearStorageData({
+                storages,
+                quotas: ['temporary', 'persistent', 'syncable'],
+            });
+        } catch (error) {
+            authLog('LOGOUT_STORAGE_ERROR', { message: error && error.message ? error.message : String(error) });
+        }
+    }
+    authLog('LOGOUT_FINISHED', {});
     return true;
+});
+
+ipcMain.handle('get-login-state', async () => getLoginStateSnapshot());
+
+// Renderer confirms it refreshed auth state and navigated to the dashboard,
+// cancelling the force-refresh watchdog.
+ipcMain.on('auth-renderer-ack', () => {
+    authLog('RENDERER_ACK', {});
+    clearRendererAckTimer();
 });
 
 ipcMain.handle('record-api-event', async (_event, payload) => {

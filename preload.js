@@ -21,13 +21,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
         ipcRenderer.on('auth-token-received', listener);
         return () => ipcRenderer.removeListener('auth-token-received', listener);
     },
+    ackDesktopLogin: () => ipcRenderer.send('auth-renderer-ack'),
     checkInternet: () => ipcRenderer.invoke('check-backend-health').then((result) => Boolean(result?.reachable)),
+    getConnectivityStatus: () => ipcRenderer.invoke('get-connectivity-status'),
     pollDesktopAuthToken: () => ipcRenderer.invoke('poll-desktop-auth-token'),
     retryLoad: () => ipcRenderer.send('retry-load'),
     clearAuthSession: () => ipcRenderer.invoke('clear-auth-session'),
     getSecureAuthToken: () => ipcRenderer.invoke('get-secure-auth-token'),
     setSecureAuthToken: (token) => ipcRenderer.invoke('set-secure-auth-token', token),
     clearSecureAuthToken: () => ipcRenderer.invoke('clear-secure-auth-token'),
+    getLoginState: () => ipcRenderer.invoke('get-login-state'),
     recordApiEvent: (payload) => ipcRenderer.invoke('record-api-event', payload),
     recordRuntimeError: (payload) => ipcRenderer.invoke('record-runtime-error', payload),
     getApiMonitorSnapshot: () => ipcRenderer.invoke('get-api-monitor-snapshot'),

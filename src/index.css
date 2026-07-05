@@ -1133,57 +1133,47 @@ a[style*="--danger"] {
 
 .auth-only {
   height: 100vh;
+  height: 100dvh;
   max-height: 100vh;
+  max-height: 100dvh;
   overflow: hidden;
   background: var(--bg-primary);
 }
 
-.auth-only .template-page {
-  padding: 0;
-  margin: 0;
-  height: 100%;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.auth-only .template-page > div:first-child {
-  height: 100%;
-  min-height: 0;
-}
-
 .auth-only .auth-page-container {
-  height: 100vh;
-  max-height: 100vh;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.auth-only .auth-illustration-side {
-  flex: 1;
   height: 100%;
-  max-height: 100vh;
+  min-height: 100%;
+  max-height: 100%;
   overflow: hidden;
-  align-self: stretch;
 }
 
 .auth-only .auth-form-side {
   flex: 1.2;
   height: 100%;
-  max-height: 100vh;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
+  display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px 32px;
+  padding: clamp(16px, 4vw, 32px);
+  box-sizing: border-box;
+}
+
+.auth-only .auth-illustration-side {
+  flex: 1;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .auth-only .auth-content,
 .auth-only .auth-card {
-  width: 100%;
-  max-width: 380px;
+  width: min(100%, 380px);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1193,6 +1183,7 @@ a[style*="--danger"] {
   border: none;
   box-shadow: none;
   padding: 0;
+  box-sizing: border-box;
 }
 
 .auth-only .auth-header {
@@ -1201,25 +1192,34 @@ a[style*="--danger"] {
 }
 
 .auth-only .google-btn {
-  width: 100%;
-  max-width: 320px;
+  width: min(100%, 320px);
   margin: 0 auto;
+  justify-content: center;
 }
 
 .auth-only #config-error,
-.auth-only #auth-loading {
-  width: 100%;
-  max-width: 320px;
+.auth-only #auth-loading,
+.auth-only .auth-footer {
+  width: min(100%, 320px);
   margin-left: auto;
   margin-right: auto;
+  box-sizing: border-box;
 }
 
 .auth-only .auth-footer {
-  width: 100%;
-  max-width: 320px;
-  margin-top: 32px;
+  margin-top: 28px;
   padding-top: 0;
   border-top: none;
+}
+
+@media (max-width: 1024px) {
+  .auth-only .auth-illustration-side {
+    display: none;
+  }
+
+  .auth-only .auth-form-side {
+    flex: 1;
+  }
 }
 
 .auth-only input,

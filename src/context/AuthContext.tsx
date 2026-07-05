@@ -47,6 +47,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loginCompleting, setLoginCompleting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const callbackInFlight = useRef(false);
+  const loginNavigatePending = useRef(false);
   const refreshInFlight = useRef<Promise<boolean> | null>(null);
   const authChecked = useRef(false);
 
@@ -77,8 +78,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const token = await getAuthToken();
         if (!token) {
           stopNotificationPoller();
-          setUser(null);
-          localStorage.removeItem('lerzo_user');
+          if (!callbackInFlight.current) {
+            setUser(null);
+            localStorage.removeItem('lerzo_user');
+          }
           return false;
         }
 
@@ -87,9 +90,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         if (!currentUser) {
           stopNotificationPoller();
-          await clearAuthTokens();
-          setUser(null);
-          localStorage.removeItem('lerzo_user');
+          if (!callbackInFlight.current) {
+            await clearAuthTokens();
+            setUser(null);
+            localStorage.removeItem('lerzo_user');
+          }
           setAuthError('Login session could not be verified.');
           return false;
         }
@@ -151,19 +156,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const ok = await refreshUser({ silent: true });
       if (ok) {
-        if (window.location.hash !== '#/dashboard') {
-          window.location.hash = '#/dashboard';
-        }
+        loginNavigatePending.current = true;
         return true;
       }
 
       window.location.hash = '#/auth-error?message=Login%20verification%20failed.%20Please%20try%20again.';
       return false;
     } finally {
-      callbackInFlight.current = false;
-      setLoginCompleting(false);
+      if (!loginNavigatePending.current) {
+        callbackInFlight.current = false;
+        setLoginCompleting(false);
+      }
     }
   }, [refreshUser]);
+
+  useEffect(() => {
+    if (!loginNavigatePending.current || !user) {
+      return;
+    }
+
+    loginNavigatePending.current = false;
+    callbackInFlight.current = false;
+    if (window.location.hash !== '#/dashboard') {
+      window.location.hash = '#/dashboard';
+    }
+    setLoginCompleting(false);
+    // Tell the main process we successfully refreshed auth + navigated so it can
+    // cancel the force-refresh watchdog. Never leave main waiting for a restart.
+    window.electronAPI?.ackDesktopLogin?.();
+  }, [user]);
 
   const logout = useCallback(async () => {
     stopNotificationPoller();
@@ -209,6 +230,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
 
     const handleLoginComplete = () => {
+      if (callbackInFlight.current) return;
       void handleLoginCallback();
     };
 

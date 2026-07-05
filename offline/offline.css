@@ -52,3 +52,17 @@ p {
     transform: translateY(-2px);
     box-shadow: 0 5px 15px rgba(139, 92, 246, 0.4);
 }
+
+#retry-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+    transform: none;
+    box-shadow: none;
+}
+
+.status-line {
+    margin-top: 18px;
+    min-height: 18px;
+    font-size: 13px;
+    color: #64748b;
+}

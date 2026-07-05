@@ -1,0 +1,250 @@
+#!/usr/bin/env node
+/**
+ * Static + local verification for Electron auth lifecycle.
+ * Run: node scripts/verify-auth-lifecycle.mjs
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const failures = [];
+const passes = [];
+
+function pass(msg) {
+  passes.push(msg);
+}
+
+function fail(msg) {
+  failures.push(msg);
+}
+
+function read(rel) {
+  return fs.readFileSync(path.join(root, rel), 'utf8');
+}
+
+function assertNoMatch(rel, pattern, label) {
+  const content = read(rel);
+  if (pattern.test(content)) {
+    fail(`${label} (${rel})`);
+    return false;
+  }
+  pass(`${label} OK (${rel})`);
+  return true;
+}
+
+function assertMatch(rel, pattern, label) {
+  const content = read(rel);
+  if (!pattern.test(content)) {
+    fail(`${label} missing (${rel})`);
+    return false;
+  }
+  pass(`${label} OK (${rel})`);
+  return true;
+}
+
+// 1. Main process must NOT navigate before renderer auth is ready
+assertNoMatch(
+  'main.js',
+  /notifyRendererLoginComplete[\s\S]*?window\.location\.hash\s*=\s*['"]#\/dashboard['"]/,
+  'Main notifyRendererLoginComplete must not set #/dashboard hash',
+);
+
+// 2. TemplateHtmlPage must not set dashboard hash in completeElectronLoginFromToken
+(function assertCompleteElectronLoginFromToken() {
+  const content = read('src/components/TemplateHtmlPage.tsx');
+  const match = content.match(/async function completeElectronLoginFromToken[\s\S]*?\n\}/);
+  if (!match) {
+    fail('completeElectronLoginFromToken function not found (src/components/TemplateHtmlPage.tsx)');
+    return;
+  }
+  if (/window\.location\.hash\s*=\s*['"]#\/dashboard['"]/.test(match[0])) {
+    fail('completeElectronLoginFromToken must not set #/dashboard hash (src/components/TemplateHtmlPage.tsx)');
+  } else {
+    pass('completeElectronLoginFromToken must not set #/dashboard hash OK (src/components/TemplateHtmlPage.tsx)');
+  }
+}());
+
+// 3. AuthContext must navigate only after user is loaded (post-refreshUser)
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /loginNavigatePending[\s\S]*?if \(!loginNavigatePending\.current \|\| !user\)[\s\S]*?window\.location\.hash = '#\/dashboard'/,
+  'AuthContext navigates dashboard only after user state is set',
+);
+
+// 4. loginCompleting gate in App
+assertMatch(
+  'src/App.tsx',
+  /loginCompleting[\s\S]*?LoadingScreen/,
+  'App shows loader while loginCompleting',
+);
+
+// 5. Boot must not wipe user during active login callback
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /if \(!token\)[\s\S]*?callbackInFlight\.current/,
+  'refreshUser skips user wipe during login callback',
+);
+
+// 6. Logout redirects to login
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /logout[\s\S]*?#\/auth-login/,
+  'logout redirects to auth-login',
+);
+
+// 7. desktop-success auto-close hint
+assertMatch(
+  '../lerzo_web-main/templates/auth/desktop_success.html',
+  /window\.close|attemptClose|closeTab/,
+  'desktop-success attempts browser tab close',
+);
+
+// 8. Login page centered layout
+assertMatch(
+  'src/index.css',
+  /\.auth-only \.auth-form-side[\s\S]*?justify-content:\s*center[\s\S]*?align-items:\s*center/,
+  'auth-only form side centered',
+);
+
+// 9. Duplicate event dedupe
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /if \(callbackInFlight\.current\) \{[\s\S]*?return false/,
+  'handleLoginCallback dedupes concurrent callbacks',
+);
+
+// --- Login transaction / state machine invariants (main process) ---
+
+// 10. State machine states are defined
+assertMatch(
+  'main.js',
+  /LOGIN_STATE\s*=\s*Object\.freeze\(\{[\s\S]*?IDLE[\s\S]*?LOGIN_STARTED[\s\S]*?WAITING_CALLBACK[\s\S]*?VERIFYING[\s\S]*?AUTHENTICATED[\s\S]*?LOGGED_OUT/,
+  'main defines full login state machine',
+);
+
+// 11. A single-use nonce is generated when login starts
+assertMatch(
+  'main.js',
+  /function beginLoginTransaction\(\)[\s\S]*?crypto\.randomBytes[\s\S]*?WAITING_CALLBACK/,
+  'beginLoginTransaction mints a nonce and enters WAITING_CALLBACK',
+);
+
+// 12. Callback is rejected unless a login is actively pending and WAITING_CALLBACK
+assertMatch(
+  'main.js',
+  /if \(!isPendingLoginActive\(\) \|\| loginState !== LOGIN_STATE\.WAITING_CALLBACK\)[\s\S]*?CALLBACK_REJECTED[\s\S]*?no_active_login_request/,
+  'handleAuthCallback rejects callbacks outside an active transaction',
+);
+
+// 13. State must match the pending nonce
+assertMatch(
+  'main.js',
+  /if \(state !== pendingLogin\.nonce\)[\s\S]*?state_mismatch/,
+  'handleAuthCallback enforces state === pending nonce',
+);
+
+// 14. Nonce is consumed exactly once (replay protection)
+assertMatch(
+  'main.js',
+  /consumedNonces\.add\(state\)[\s\S]*?clearPendingLogin\(\)[\s\S]*?CALLBACK_ACCEPTED/,
+  'handleAuthCallback consumes the nonce before verifying (one-time use)',
+);
+assertMatch(
+  'main.js',
+  /if \(consumedNonces\.has\(state\)\)[\s\S]*?replay_consumed/,
+  'handleAuthCallback rejects already-consumed nonces',
+);
+
+// 15. Login IPC attaches the state nonce to the OAuth URL
+assertMatch(
+  'main.js',
+  /beginLoginTransaction\(\)[\s\S]*?appendQueryParam\([\s\S]*?'state', nonce\)/,
+  'login IPC attaches state nonce to OAuth URL',
+);
+
+// 16. Startup ignores deep links unless a login is pending
+assertMatch(
+  'main.js',
+  /if \(isPendingLoginActive\(\)\)[\s\S]*?handleAuthCallback\(pendingCallbackUrl, 'argv'\)[\s\S]*?no_active_login_request_at_startup/,
+  'startup argv deep link gated on active login',
+);
+
+// 17. Logout wipes everything and resets the machine
+assertMatch(
+  'main.js',
+  /LOGOUT_STARTED[\s\S]*?clearSecureAuthToken\(\)[\s\S]*?clearPendingLogin\(\)[\s\S]*?consumedNonces\.clear\(\)[\s\S]*?LOGGED_OUT[\s\S]*?indexdb[\s\S]*?LOGOUT_FINISHED/,
+  'logout clears token, pending login, nonces, storage and resets state',
+);
+
+// 18. Structured lifecycle logging present
+['LOGIN_STARTED', 'OAUTH_OPENED', 'CALLBACK_RECEIVED', 'CALLBACK_ACCEPTED', 'CALLBACK_REJECTED', 'JWT_SAVED', 'ME_RESPONSE', 'AUTHENTICATED', 'LOGOUT_FINISHED'].forEach((evt) => {
+  assertMatch('main.js', new RegExp(`authLog\\('${evt}'`), `structured log: ${evt}`);
+});
+
+// --- Web side transaction threading ---
+
+// 19. google_login_start captures the state nonce into the session
+assertMatch(
+  '../lerzo_web-main/routes/auth.py',
+  /state = request\.args\.get\('state'\)[\s\S]*?session\['electron_state'\] = state/,
+  'web google_login_start stores login state nonce',
+);
+
+// 20. desktop success echoes state back in the deep link and is one-time
+assertMatch(
+  '../lerzo_web-main/routes/auth.py',
+  /callback_url \+= f"&state=\{quote\(str\(state\)[\s\S]*?session\.pop\('electron_state', None\)[\s\S]*?session\.pop\('desktop_bridge_token', None\)/,
+  'web desktop success echoes state and consumes it (one-time)',
+);
+
+// 21. desktop_success.html has a one-time execution guard
+assertMatch(
+  '../lerzo_web-main/templates/auth/desktop_success.html',
+  /lerzo_desktop_link_fired[\s\S]*?sessionStorage[\s\S]*?history\.replaceState/,
+  'desktop-success page guards against reload/back replay',
+);
+
+// --- Immediate renderer notification + ack watchdog ---
+
+// 22. Main arms a 2s renderer-ack watchdog after notifying
+assertMatch(
+  'main.js',
+  /const RENDERER_ACK_TIMEOUT_MS = 2000/,
+  'renderer ack watchdog uses a 2s timeout',
+);
+assertMatch(
+  'main.js',
+  /async function notifyRendererLoginComplete\(\)[\s\S]*?send\('auth-token-received'\)[\s\S]*?armRendererAckWatchdog\(\)/,
+  'notifyRendererLoginComplete pushes IPC then arms the ack watchdog',
+);
+
+// 23. On ack timeout, force a renderer session refresh (not app restart)
+assertMatch(
+  'main.js',
+  /forceRendererSessionRefresh[\s\S]*?navigateMainWindow\('#\/dashboard'\)/,
+  'ack timeout forces a renderer session refresh to the dashboard',
+);
+assertMatch(
+  'main.js',
+  /ipcMain\.on\('auth-renderer-ack'[\s\S]*?clearRendererAckTimer\(\)/,
+  'renderer ack cancels the watchdog',
+);
+
+// 24. Renderer acknowledges after navigating to the dashboard
+assertMatch(
+  'src/context/AuthContext.tsx',
+  /window\.location\.hash = '#\/dashboard'[\s\S]*?electronAPI\?\.ackDesktopLogin\?\.\(\)/,
+  'renderer acks main after dashboard navigation',
+);
+assertMatch(
+  'preload.js',
+  /ackDesktopLogin:\s*\(\)\s*=>\s*ipcRenderer\.send\('auth-renderer-ack'\)/,
+  'preload exposes ackDesktopLogin',
+);
+
+console.log('\n=== Electron Auth Lifecycle Verification ===\n');
+passes.forEach((p) => console.log('✓', p));
+failures.forEach((f) => console.log('✗', f));
+console.log(`\n${passes.length} passed, ${failures.length} failed\n`);
+process.exit(failures.length ? 1 : 0);

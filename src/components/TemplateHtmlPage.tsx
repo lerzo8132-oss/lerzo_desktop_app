@@ -543,16 +543,29 @@ async function completeElectronLoginFromToken(root: HTMLElement) {
 
 function startDesktopAuthCompletionWatch(root: HTMLElement) {
   let stopped = false;
+  let completed = false;
   let attempts = 0;
   const maxAttempts = 30;
   let pollTimer: number | undefined;
 
+  // Removing the listener here (before any completion work) is critical: the
+  // completion path dispatches 'lerzo-login-complete' again to notify the auth
+  // context. If the watch listener were still attached it would re-enter this
+  // watch synchronously and overflow the call stack.
   const stop = () => {
     stopped = true;
     if (pollTimer) {
       window.clearTimeout(pollTimer);
       pollTimer = undefined;
     }
+    window.removeEventListener('lerzo-login-complete', onLoginComplete);
+  };
+
+  const finish = async () => {
+    if (completed) return;
+    completed = true;
+    stop();
+    await completeElectronLoginFromToken(root);
   };
 
   const poll = async () => {
@@ -562,20 +575,20 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
     try {
       const polled = await window.electronAPI?.pollDesktopAuthToken?.();
       if (polled?.ready) {
-        stop();
-        await completeElectronLoginFromToken(root);
+        await finish();
         return;
       }
 
       const token = await window.electronAPI?.getSecureAuthToken?.();
       if (token) {
-        stop();
-        await completeElectronLoginFromToken(root);
+        await finish();
         return;
       }
     } catch (error) {
       console.warn('[Renderer Auth] desktop login poll failed =', error);
     }
+
+    if (stopped) return;
 
     if (attempts >= maxAttempts) {
       stop();
@@ -592,8 +605,7 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
   };
 
   const onLoginComplete = () => {
-    stop();
-    void completeElectronLoginFromToken(root);
+    void finish();
   };
 
   window.addEventListener('lerzo-login-complete', onLoginComplete);
@@ -603,7 +615,6 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
 
   return () => {
     stop();
-    window.removeEventListener('lerzo-login-complete', onLoginComplete);
   };
 }
 

@@ -32,11 +32,19 @@ interface Window {
       logoutUrl: string;
     }>;
     checkInternet?: () => Promise<boolean>;
+    getConnectivityStatus?: () => Promise<{ reason: 'network' | 'server' | 'renderer'; internet: boolean; backend: boolean }>;
     pollDesktopAuthToken?: () => Promise<{ ready: boolean; error?: string }>;
     getSecureAuthToken?: () => Promise<string | null>;
     setSecureAuthToken?: (token: string) => Promise<boolean>;
     clearSecureAuthToken?: () => Promise<boolean>;
+    getLoginState?: () => Promise<{
+      loginState: string;
+      pending: boolean;
+      pendingExpiresAt: number | null;
+      consumedCount: number;
+    }>;
     onAuthTokenReceived?: (callback: () => void) => () => void;
+    ackDesktopLogin?: () => void;
     recordApiEvent?: (payload: unknown) => Promise<boolean>;
     recordRuntimeError?: (payload: unknown) => Promise<boolean>;
     getApiMonitorSnapshot?: () => Promise<unknown>;

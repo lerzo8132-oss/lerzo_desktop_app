@@ -17,8 +17,8 @@
   "scripts": {
     "start": "electron .",
     "vite:dev": "vite --host 127.0.0.1 --port 5173",
-    "electron:dev": "LERZO_API_CONFIG_MODE=production wait-on http://127.0.0.1:5173 && LERZO_API_CONFIG_MODE=production electron .",
-    "electron:dev:prod": "LERZO_API_CONFIG_MODE=production wait-on http://127.0.0.1:5173 && LERZO_API_CONFIG_MODE=production electron .",
+    "electron:dev": "LERZO_API_CONFIG_MODE=production env -u ELECTRON_RUN_AS_NODE wait-on http://127.0.0.1:5173 && LERZO_API_CONFIG_MODE=production env -u ELECTRON_RUN_AS_NODE electron .",
+    "electron:dev:prod": "LERZO_API_CONFIG_MODE=production env -u ELECTRON_RUN_AS_NODE wait-on http://127.0.0.1:5173 && LERZO_API_CONFIG_MODE=production env -u ELECTRON_RUN_AS_NODE electron .",
     "dev": "npm run dev:prod",
     "dev:prod": "concurrently -k \"npm run vite:dev\" \"npm run electron:dev:prod\"",
     "vite:build": "vite build",
@@ -32,7 +32,8 @@
     "build:linux": "npm run vite:build && electron-builder --linux",
     "publish": "electron-builder --publish always",
     "clean": "rm -rf dist release node_modules",
-    "clean:mac": "rm -rf ~/Library/Saved\\ Application\\ State/com.lerzo.desktop.savedState && rm -rf ~/Library/Caches/com.lerzo.desktop && killall Dock"
+    "verify:auth": "node scripts/verify-auth-lifecycle.mjs",
+    "probe:auth": "node scripts/run-auth-probe.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",

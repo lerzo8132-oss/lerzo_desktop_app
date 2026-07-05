@@ -2,15 +2,16 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Offline - Lerzo</title>
+    <title>Connection Problem - Lerzo</title>
     <link rel="stylesheet" href="offline.css">
 </head>
 <body>
     <div class="offline-container">
-        <div class="icon">📡</div>
-        <h1>No Internet Connection</h1>
-        <p>Please check your network settings and try again.</p>
+        <div class="icon" id="status-icon">📡</div>
+        <h1 id="status-title">Checking connection…</h1>
+        <p id="status-message">Please wait while we check your connection.</p>
         <button id="retry-btn">Retry Reconnecting</button>
+        <div class="status-line" id="status-line"></div>
     </div>
     <script src="offline.js"></script>
 </body>
