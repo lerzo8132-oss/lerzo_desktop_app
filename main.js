@@ -152,16 +152,15 @@ function getRendererIndexPath() {
 
 function getElectronStartUrl(hash = '') {
     const normalizedHash = hash ? (hash.startsWith('#') ? hash : `#${hash}`) : '';
-    if (!IS_PROD) {
-        return `${RENDERER_DEV_URL}${normalizedHash}`;
+    if (IS_PROD) {
+        const indexFile = path.join(app.getAppPath(), 'dist', 'index.html');
+        if (fs.existsSync(indexFile)) {
+            return `${pathToFileURL(indexFile).toString()}${normalizedHash}`;
+        }
+        throw new Error(`Packaged renderer is missing: ${indexFile}`);
     }
 
-    const indexFile = getRendererIndexPath();
-    if (fs.existsSync(indexFile)) {
-        return `${pathToFileURL(indexFile).toString()}${normalizedHash}`;
-    }
-
-    throw new Error(`Packaged renderer is missing: ${indexFile}`);
+    return `${RENDERER_DEV_URL}${normalizedHash}`;
 }
 
 function closeSplashWindow() {
@@ -206,18 +205,65 @@ function recordLoadFailure(error, target) {
 }
 
 let devRendererRetryAttempts = 0;
-const DEV_RENDERER_MAX_RETRIES = 40;
+const DEV_RENDERER_MAX_RETRIES = 6;
 const DEV_RENDERER_RETRY_DELAY_MS = 500;
+const DEV_SERVER_PROBE_TIMEOUT_MS = 2500;
+let devServerReachableCache = null;
 
 function resetDevRendererRetries() {
     devRendererRetryAttempts = 0;
 }
 
-// In dev, the Vite server may not be listening yet when Electron boots. A failed
-// load of the dev URL is NOT an offline condition; retry until Vite is ready.
-function scheduleDevRendererRetry() {
+function getDevServerUnreachablePath() {
+    return path.join(app.getAppPath(), 'offline', 'dev-server.html');
+}
+
+async function probeDevServerReachable() {
     if (IS_PROD) return false;
-    if (devRendererRetryAttempts >= DEV_RENDERER_MAX_RETRIES) return false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DEV_SERVER_PROBE_TIMEOUT_MS);
+    try {
+        const response = await fetch(RENDERER_DEV_URL, {
+            method: 'GET',
+            signal: controller.signal,
+            headers: { Accept: 'text/html' },
+        });
+        // Vite answers 200/304 while starting; any sub-500 response means the port is listening.
+        devServerReachableCache = response.status > 0 && response.status < 500;
+        return devServerReachableCache;
+    } catch {
+        devServerReachableCache = false;
+        return false;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function showDevServerUnreachablePage() {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const devPath = getDevServerUnreachablePath();
+    startupLog('DEV_SERVER_UNREACHABLE', { url: RENDERER_DEV_URL, page: devPath });
+    closeSplashWindow();
+    mainWindow.show();
+    if (fs.existsSync(devPath)) {
+        await mainWindow.loadFile(devPath).catch((error) => recordLoadFailure(error, devPath));
+    } else {
+        await mainWindow.loadURL(`data:text/html,${encodeURIComponent(
+            '<html><body style="font-family:sans-serif;padding:40px;text-align:center">'
+            + '<h1>Dev server not running</h1>'
+            + '<p>Run <code>npm run dev</code></p></body></html>',
+        )}`).catch((error) => recordLoadFailure(error, 'dev-server-fallback'));
+    }
+}
+
+// In dev, probe Vite before loading localhost. A small retry window covers Vite
+// still starting; after that show a clear message instead of a blank screen.
+async function scheduleDevRendererRetry() {
+    if (IS_PROD) return false;
+    if (devRendererRetryAttempts >= DEV_RENDERER_MAX_RETRIES) {
+        await showDevServerUnreachablePage();
+        return false;
+    }
     devRendererRetryAttempts += 1;
     startupLog('Dev renderer retry scheduled', {
         attempt: devRendererRetryAttempts,
@@ -225,7 +271,7 @@ function scheduleDevRendererRetry() {
     });
     setTimeout(() => {
         if (mainWindow && !mainWindow.isDestroyed()) {
-            navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
+            void navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
         }
     }, DEV_RENDERER_RETRY_DELAY_MS);
     return true;
@@ -272,6 +318,20 @@ async function showConnectivityFallback(offlinePath, context = {}) {
 
     const status = await classifyConnectivity();
     startupLog('Connectivity fallback', { ...context, ...status });
+
+    // Backend health is OK — never show "No Internet Connection" for a renderer
+    // load glitch. Retry the SPA instead.
+    if (status.backend) {
+        startupLog('Connectivity fallback skipped — backend reachable', { ...context, ...status });
+        resetDevRendererRetries();
+        closeSplashWindow();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
+            mainWindow.show();
+            mainWindow.focus();
+        }
+        return;
+    }
 
     try {
         await mainWindow.loadFile(offlinePath, {
@@ -920,38 +980,47 @@ function createSplashWindow() {
     }
 }
 
-function navigateMainWindow(hash = '') {
+async function navigateMainWindow(hash = '') {
     if (!mainWindow) return;
 
-    if (!IS_PROD) {
-        const targetUrl = getElectronStartUrl(hash);
-        startupLog('Loading renderer (dev)', { targetUrl });
-        mainWindow.loadURL(targetUrl).catch((error) => recordLoadFailure(error, targetUrl));
-        return;
-    }
+    if (IS_PROD) {
+        const indexPath = path.join(app.getAppPath(), 'dist', 'index.html');
+        const routeHash = normalizeRouteHash(hash);
+        startupLog('LOADING_PACKAGED_RENDERER', {
+            indexPath,
+            routeHash,
+            exists: fs.existsSync(indexPath),
+            appPath: app.getAppPath(),
+        });
 
-    const indexPath = getRendererIndexPath();
-    const routeHash = normalizeRouteHash(hash);
-    startupLog('Loading renderer (prod)', {
-        indexPath,
-        routeHash,
-        exists: fs.existsSync(indexPath),
-        appPath: app.getAppPath(),
-        dirname: __dirname,
-        resourcesPath: process.resourcesPath
-    });
-
-    if (!fs.existsSync(indexPath)) {
-        recordLoadFailure(new Error(`Packaged renderer is missing: ${indexPath}`), indexPath);
-        const offlinePath = path.join(app.getAppPath(), 'offline', 'offline.html');
-        if (fs.existsSync(offlinePath)) {
-            mainWindow.loadFile(offlinePath).catch((error) => recordLoadFailure(error, offlinePath));
+        if (!fs.existsSync(indexPath)) {
+            recordLoadFailure(new Error(`Packaged renderer is missing: ${indexPath}`), indexPath);
+            const offlinePath = path.join(app.getAppPath(), 'offline', 'offline.html');
+            if (fs.existsSync(offlinePath)) {
+                await mainWindow.loadFile(offlinePath).catch((error) => recordLoadFailure(error, offlinePath));
+            }
+            return;
         }
+
+        const loadOptions = routeHash ? { hash: routeHash } : undefined;
+        await mainWindow.loadFile(indexPath, loadOptions).catch((error) => recordLoadFailure(error, indexPath));
         return;
     }
 
-    const loadOptions = routeHash ? { hash: routeHash } : undefined;
-    mainWindow.loadFile(indexPath, loadOptions).catch((error) => recordLoadFailure(error, indexPath));
+    const reachable = devServerReachableCache === true || await probeDevServerReachable();
+    if (!reachable) {
+        await showDevServerUnreachablePage();
+        return;
+    }
+
+    resetDevRendererRetries();
+    const targetUrl = getElectronStartUrl(hash);
+    startupLog('LOADING_DEV_RENDERER', { targetUrl });
+    await mainWindow.loadURL(targetUrl).catch(async (error) => {
+        recordLoadFailure(error, targetUrl);
+        devServerReachableCache = false;
+        await showDevServerUnreachablePage();
+    });
 }
 
 async function navigateRendererHash(hash = '#/dashboard') {
@@ -985,11 +1054,11 @@ async function navigateRendererHash(hash = '#/dashboard') {
             return true;
         }
 
-        navigateMainWindow(normalizedHash);
+        void navigateMainWindow(normalizedHash);
         return true;
     } catch (error) {
         console.error('[Electron Auth] hash navigation failed =', error);
-        navigateMainWindow(normalizedHash);
+        void navigateMainWindow(normalizedHash);
         return false;
     }
 }
@@ -1496,7 +1565,7 @@ function createMainWindow() {
     });
 
     const initialHash = loadSecureAuthToken() ? '#/dashboard' : '#/auth-login';
-    navigateMainWindow(initialHash);
+    void navigateMainWindow(initialHash);
 
     mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
         if (!ELECTRON_DEBUG && IS_PROD && level !== 3) return;
@@ -1551,9 +1620,10 @@ function createMainWindow() {
         });
         apiMonitorState.errors = apiMonitorState.errors.slice(0, 100);
 
-        // Dev: Vite server may still be starting; silently retry instead of
-        // flashing a misleading offline screen.
-        if (!IS_PROD && validatedURL.startsWith(RENDERER_DEV_URL) && scheduleDevRendererRetry()) {
+        // Dev: Vite may still be starting — retry briefly, then show dev-server page.
+        if (!IS_PROD && validatedURL.startsWith(RENDERER_DEV_URL)) {
+            devServerReachableCache = false;
+            void scheduleDevRendererRetry();
             return;
         }
 
@@ -1657,13 +1727,111 @@ function createMenu() {
     Menu.setApplicationMenu(menu);
 }
 
+// Capture argv before Electron or the runtime mutates it (Windows cold-start deep links).
+const INITIAL_ARGV = process.argv.slice();
+let queuedDeepLinkUrl = null;
+
+function extractDeepLinkFromArgs(args) {
+    if (!Array.isArray(args)) return null;
+    for (const raw of args) {
+        if (typeof raw !== 'string') continue;
+        let candidate = raw.trim();
+        if ((candidate.startsWith('"') && candidate.endsWith('"')) || (candidate.startsWith("'") && candidate.endsWith("'"))) {
+            candidate = candidate.slice(1, -1);
+        }
+        if (candidate.startsWith('lerzo://')) {
+            return candidate;
+        }
+        try {
+            const decoded = decodeURIComponent(candidate);
+            if (decoded.startsWith('lerzo://')) {
+                return decoded;
+            }
+        } catch {
+            // ignore malformed encodings
+        }
+    }
+    return null;
+}
+
+function registerLerzoProtocolClient() {
+    let registered = false;
+    try {
+        if (process.defaultApp) {
+            registered = app.setAsDefaultProtocolClient('lerzo', process.execPath, [path.resolve(process.argv[1])]);
+        } else if (process.platform === 'win32') {
+            // Packaged Windows builds must bind the handler to the installed .exe.
+            registered = app.setAsDefaultProtocolClient('lerzo', process.execPath, []);
+        } else {
+            registered = app.setAsDefaultProtocolClient('lerzo');
+        }
+    } catch (error) {
+        authLog('PROTOCOL_REGISTERED', {
+            ok: false,
+            platform: process.platform,
+            packaged: app.isPackaged,
+            execPath: process.execPath,
+            message: error && error.message ? error.message : String(error),
+        });
+        return false;
+    }
+    authLog('PROTOCOL_REGISTERED', {
+        ok: registered,
+        isDefault: app.isDefaultProtocolClient('lerzo'),
+        platform: process.platform,
+        packaged: app.isPackaged,
+        execPath: process.execPath,
+    });
+    return registered;
+}
+
+function queueDeepLink(url, source) {
+    if (!url) return;
+    queuedDeepLinkUrl = url;
+    authLog('CALLBACK_QUEUED', {
+        source,
+        url: url.split('token=')[0] + (url.includes('token=') ? 'token=<redacted>' : ''),
+    });
+}
+
+function deliverDeepLink(url, source) {
+    if (!url) return;
+    if (!app.isReady()) {
+        queueDeepLink(url, source);
+        return;
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        if (app.isReady()) {
+            createMainWindow();
+        }
+        queueDeepLink(url, source);
+        return;
+    }
+    void handleAuthCallback(url, source);
+}
+
+function flushQueuedDeepLink() {
+    if (!queuedDeepLinkUrl) return;
+    const url = queuedDeepLinkUrl;
+    queuedDeepLinkUrl = null;
+    if (!isPendingLoginActive()) {
+        authLog('CALLBACK_REJECTED', { source: 'queued', reason: 'no_active_login_request' });
+        return;
+    }
+    void handleAuthCallback(url, 'queued');
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
     app.quit();
 } else {
     app.on('second-instance', (_event, argv) => {
-        startupLog('Second instance argv received', { argv });
+        const deepLink = extractDeepLinkFromArgs(argv);
+        authLog('SECOND_INSTANCE_ARGV', {
+            argv,
+            deepLink: deepLink ? deepLink.split('token=')[0] + 'token=<redacted>' : null,
+        });
         // The user clicked "Return to desktop app": always surface the existing
         // window so it visibly receives the callback (Windows deep-link path).
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1673,19 +1841,29 @@ if (!gotSingleInstanceLock) {
         } else if (app.isReady()) {
             createMainWindow();
         }
-        const callbackUrl = argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
-        if (callbackUrl) {
-            void handleAuthCallback(callbackUrl, 'second-instance');
+        if (deepLink) {
+            deliverDeepLink(deepLink, 'second-instance');
         }
     });
 }
 
 app.on('open-url', (event, url) => {
     event.preventDefault();
-    void handleAuthCallback(url, 'open-url');
+    deliverDeepLink(url, 'open-url');
 });
 
 if (gotSingleInstanceLock) {
+    // Windows requires protocol registration before the ready event.
+    registerLerzoProtocolClient();
+    const initialDeepLink = extractDeepLinkFromArgs(INITIAL_ARGV);
+    authLog('INITIAL_ARGV', {
+        argv: INITIAL_ARGV,
+        deepLink: initialDeepLink ? initialDeepLink.split('token=')[0] + 'token=<redacted>' : null,
+    });
+    if (initialDeepLink) {
+        queueDeepLink(initialDeepLink, 'argv');
+    }
+
     app.whenReady().then(() => {
         const indexPath = getRendererIndexPath();
         startupLog('Lerzo startup', {
@@ -1724,11 +1902,6 @@ if (gotSingleInstanceLock) {
         });
         console.log(`[Lerzo] Desktop health check endpoint: ${healthUrl}`);
         console.log(`[Lerzo] Desktop Google login endpoint: ${googleLoginUrl}`);
-        if (process.defaultApp) {
-            app.setAsDefaultProtocolClient('lerzo', process.execPath, [path.resolve(process.argv[1])]);
-        } else {
-            app.setAsDefaultProtocolClient('lerzo');
-        }
         createMenu();
         createSplashWindow();
         createMainWindow();
@@ -1739,14 +1912,9 @@ if (gotSingleInstanceLock) {
             }, 2500);
         }
 
-        const pendingCallbackUrl = process.argv.find((arg) => typeof arg === 'string' && arg.startsWith('lerzo://'));
-        if (pendingCallbackUrl) {
-            if (isPendingLoginActive()) {
-                void handleAuthCallback(pendingCallbackUrl, 'argv');
-            } else {
-                authLog('CALLBACK_REJECTED', { source: 'argv', reason: 'no_active_login_request_at_startup' });
-            }
-        }
+        // Process any deep link captured at cold start (Windows argv) or queued
+        // while the app was still booting.
+        flushQueuedDeepLink();
         
         // Set Dock Icon for Mac
         if (process.platform === 'darwin') {
@@ -1867,9 +2035,10 @@ ipcMain.handle('clear-secure-auth-token', async () => clearSecureAuthToken());
 
 ipcMain.on('retry-load', () => {
     console.log('Retry requested. Reloading target URL.');
+    devServerReachableCache = null;
     resetDevRendererRetries();
     if (mainWindow) {
-        navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
+        void navigateMainWindow(loadSecureAuthToken() ? '#/dashboard' : '#/auth-login');
     }
 });
 
@@ -1916,7 +2085,7 @@ ipcMain.handle('get-login-state', async () => getLoginStateSnapshot());
 // Renderer confirms it refreshed auth state and navigated to the dashboard,
 // cancelling the force-refresh watchdog.
 ipcMain.on('auth-renderer-ack', () => {
-    authLog('RENDERER_ACK', {});
+    authLog('DASHBOARD_ACK', {});
     clearRendererAckTimer();
 });
 

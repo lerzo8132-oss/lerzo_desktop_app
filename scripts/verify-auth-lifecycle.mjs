@@ -168,11 +168,11 @@ assertMatch(
   'login IPC builds desktop login URL with state nonce',
 );
 
-// 16. Startup ignores deep links unless a login is pending
+// 16. Startup processes queued deep links after boot when a login is pending
 assertMatch(
   'main.js',
-  /if \(isPendingLoginActive\(\)\)[\s\S]*?handleAuthCallback\(pendingCallbackUrl, 'argv'\)[\s\S]*?no_active_login_request_at_startup/,
-  'startup argv deep link gated on active login',
+  /function flushQueuedDeepLink\(\)[\s\S]*?if \(!isPendingLoginActive\(\)\)[\s\S]*?no_active_login_request[\s\S]*?handleAuthCallback\(url, 'queued'\)/,
+  'startup flushes queued deep links gated on active login',
 );
 
 // 17. Logout wipes everything and resets the machine
@@ -232,8 +232,8 @@ assertMatch(
 );
 assertMatch(
   'main.js',
-  /ipcMain\.on\('auth-renderer-ack'[\s\S]*?clearRendererAckTimer\(\)/,
-  'renderer ack cancels the watchdog',
+  /ipcMain\.on\('auth-renderer-ack'[\s\S]*?authLog\('DASHBOARD_ACK'/,
+  'renderer ack logs DASHBOARD_ACK',
 );
 
 // 24. Renderer acknowledges after navigating to the dashboard
@@ -294,8 +294,8 @@ assertMatch(
 );
 assertMatch(
   'src/components/TemplateHtmlPage.tsx',
-  /const maxAttempts = 12/,
-  'login watch has a bounded (non-infinite) timeout',
+  /const maxAttempts = 30/,
+  'login watch has a 60s fallback poll window',
 );
 
 // --- Web side: desktop=1 recognition + robust state capture ---
@@ -361,6 +361,26 @@ assertMatch(
   'src/App.tsx',
   /if \(!isAuthenticated && !isPublicPath && !loginCompleting\)/,
   'AppRoutes suppresses /auth-login redirect while loginCompleting',
+);
+
+// 36. Windows deep-link delivery instrumentation
+['PROTOCOL_REGISTERED', 'INITIAL_ARGV', 'SECOND_INSTANCE_ARGV', 'DASHBOARD_ACK'].forEach((evt) => {
+  assertMatch('main.js', new RegExp(`authLog\\('${evt}'`), `structured log: ${evt}`);
+});
+assertMatch(
+  'main.js',
+  /function extractDeepLinkFromArgs\([\s\S]*?lerzo:\/\//,
+  'main extracts lerzo:// URLs from argv robustly',
+);
+assertMatch(
+  'main.js',
+  /registerLerzoProtocolClient\(\)[\s\S]*?process\.platform === 'win32'[\s\S]*?setAsDefaultProtocolClient\('lerzo', process\.execPath, \[\]\)/,
+  'Windows packaged protocol binds to process.execPath',
+);
+assertMatch(
+  'main.js',
+  /if \(gotSingleInstanceLock\) \{[\s\S]*?registerLerzoProtocolClient\(\)/,
+  'protocol registered before app ready on Windows',
 );
 
 console.log('\n=== Electron Auth Lifecycle Verification ===\n');

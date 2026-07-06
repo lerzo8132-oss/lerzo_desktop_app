@@ -545,9 +545,8 @@ function startDesktopAuthCompletionWatch(root: HTMLElement) {
   let stopped = false;
   let completed = false;
   let attempts = 0;
-  // ~24s of polling (12 * 2s) before giving up; the main process also pushes an
-  // immediate failure signal, so this is only a backstop for a lost callback.
-  const maxAttempts = 12;
+  // ~60s of polling (30 * 2s) as a desktop-session fallback when IPC notify is lost.
+  const maxAttempts = 30;
   let pollTimer: number | undefined;
   let unsubscribeFailed: (() => void) | undefined;
 
