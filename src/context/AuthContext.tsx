@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { AuthVerificationError, loadCurrentUser, logout as logoutRequest, refreshDesktopSession } from '../services/auth';
-import { clearAuthTokens, getAuthToken, resetAuthTokenCache } from '../services/api';
+import { clearAuthTokens, getAuthToken, resetAuthTokenCache, SubscriptionExpiredError } from '../services/api';
 import { forceHideAllLoading } from '../services/appShell';
 import {
   AUTH_CHECK_TIMEOUT_MS,
@@ -52,6 +52,16 @@ function readCachedUser(): CurrentUser | null {
     return saved ? JSON.parse(saved) as CurrentUser : null;
   } catch {
     return null;
+  }
+}
+
+function subscriptionIsInactive(user: CurrentUser | null): boolean {
+  return Boolean(user?.subscription && user.subscription.is_active === false);
+}
+
+function navigateToSubscriptionPlans() {
+  if (!window.location.hash.startsWith('#/subscription-')) {
+    window.location.hash = '#/subscription-plans';
   }
 }
 
@@ -132,9 +142,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         localStorage.setItem('lerzo_user', JSON.stringify(currentUser));
         resetAuthExpiredHandled();
         applyTheme();
-        void startNotificationPoller();
+        if (subscriptionIsInactive(currentUser)) {
+          stopNotificationPoller();
+          navigateToSubscriptionPlans();
+        } else {
+          sessionStorage.removeItem('lerzo_subscription_expired');
+          void startNotificationPoller();
+        }
         return true;
       } catch (error) {
+        if (error instanceof SubscriptionExpiredError) {
+          stopNotificationPoller();
+          navigateToSubscriptionPlans();
+          setAuthError(error.message);
+          return true;
+        }
+
         if (error instanceof AuthVerificationError && error.code === 'unauthorized') {
           stopNotificationPoller();
           await clearAuthTokens();
@@ -326,11 +349,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (callbackInFlight.current) return;
       void refreshUserRef.current({ silent: true });
     };
+    const onSubscriptionExpired = () => {
+      stopNotificationPoller();
+      navigateToSubscriptionPlans();
+      void refreshUserRef.current({ silent: true, force: true });
+    };
+    const onSubscriptionUpdated = () => {
+      sessionStorage.removeItem('lerzo_subscription_expired');
+      void refreshUserRef.current({ silent: true, force: true });
+    };
 
     const unsubscribeAuthToken = window.electronAPI?.onAuthTokenReceived?.(onDesktopLogin);
     const unsubscribeLoginComplete = window.electronAPI?.onLoginComplete?.(onDesktopLogin);
     window.addEventListener('lerzo-login-complete', onDomLoginComplete as EventListener);
     window.addEventListener('lerzo-auth-changed', onAuthChanged as EventListener);
+    window.addEventListener('lerzo-subscription-expired', onSubscriptionExpired as EventListener);
+    window.addEventListener('lerzo-subscription-updated', onSubscriptionUpdated as EventListener);
     console.log('[Renderer Auth] desktop-login listeners registered');
 
     return () => {
@@ -338,6 +372,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       unsubscribeLoginComplete?.();
       window.removeEventListener('lerzo-login-complete', onDomLoginComplete as EventListener);
       window.removeEventListener('lerzo-auth-changed', onAuthChanged as EventListener);
+      window.removeEventListener('lerzo-subscription-expired', onSubscriptionExpired as EventListener);
+      window.removeEventListener('lerzo-subscription-updated', onSubscriptionUpdated as EventListener);
     };
   }, []);
 

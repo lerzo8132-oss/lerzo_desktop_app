@@ -7,6 +7,15 @@ import { markAuthExpiredHandled, resetAuthExpiredHandled } from './authFlags';
 let inMemoryToken: string | null = null;
 let apiClientPromise: Promise<typeof api> | null = null;
 
+export class SubscriptionExpiredError extends Error {
+  code = 'SUBSCRIPTION_EXPIRED';
+
+  constructor(message = 'Trial expired or subscription inactive') {
+    super(message);
+    this.name = 'SubscriptionExpiredError';
+  }
+}
+
 export const api = axios.create({
   baseURL: '/desktop-api',
   withCredentials: true,
@@ -37,6 +46,23 @@ function releaseLoader(config?: InternalAxiosRequestConfig) {
   endRequestLoading();
 }
 
+export function isSubscriptionExpiredPayload(status?: number, data?: { code?: unknown; error?: unknown }) {
+  const marker = String(data?.code || data?.error || '');
+  return (status === 402 || status === 403) && marker === 'SUBSCRIPTION_EXPIRED';
+}
+
+export async function handleSubscriptionExpired(message?: string) {
+  const { stopNotificationPoller } = await import('./notificationsPoll');
+  stopNotificationPoller();
+  sessionStorage.setItem('lerzo_subscription_expired', '1');
+  window.dispatchEvent(new CustomEvent('lerzo-subscription-expired'));
+  const hash = window.location.hash || '';
+  if (!hash.startsWith('#/subscription-')) {
+    window.location.hash = '#/subscription-plans';
+  }
+  return new SubscriptionExpiredError(message);
+}
+
 api.interceptors.request.use(async (config) => {
   await configureApiClient();
   const token = await getAuthToken();
@@ -56,6 +82,10 @@ api.interceptors.response.use(
     releaseLoader(error?.config);
     const requestUrl = String(error?.config?.url || '');
     const isAuthMeRequest = requestUrl.includes('/auth/me');
+    if (isSubscriptionExpiredPayload(error?.response?.status, error?.response?.data)) {
+      const message = extractApiErrorMessage(error, 'Trial expired or subscription inactive.');
+      return Promise.reject(await handleSubscriptionExpired(message));
+    }
     if (error?.response?.status === 401 && isAuthMeRequest && markAuthExpiredHandled()) {
       const { stopNotificationPoller } = await import('./notificationsPoll');
       stopNotificationPoller();

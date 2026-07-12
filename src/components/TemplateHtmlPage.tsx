@@ -5,7 +5,7 @@ import { applyTheme, getStoredThemePreference } from '../theme';
 import { getApiBaseUrl, getDesktopApiBaseUrl, getWebBaseUrl, joinUrl } from '../config/api';
 import { APP_LOGO_SRC, AUTH_ILLUSTRATION_SRC, EXPORT_ILLUSTRATION_SRC } from '../config/assets';
 import { registerDesktopUser, loadCurrentUser } from '../services/auth';
-import { clearAuthTokens } from '../services/api';
+import { clearAuthTokens, handleSubscriptionExpired, isSubscriptionExpiredPayload, SubscriptionExpiredError } from '../services/api';
 import { extractApiErrorMessage } from '../services/apiErrors';
 import {
   beginPageLoading,
@@ -1257,6 +1257,10 @@ async function handleDesktopUnauthorized(endpoint?: string) {
   window.dispatchEvent(new CustomEvent('lerzo-auth-changed'));
 }
 
+async function handleDesktopSubscriptionExpired(payload?: { message?: string; error?: string }) {
+  throw await handleSubscriptionExpired(payload?.message || payload?.error || 'Trial expired or subscription inactive.');
+}
+
 interface DesktopApiOptions {
   silent?: boolean;
 }
@@ -1297,6 +1301,9 @@ async function desktopApiGet<T>(endpoint: string, options: DesktopApiOptions = {
       }
       const payload = await parseJsonResponse<T & { success?: boolean; error?: string; message?: string }>(response);
       if (!response.ok || payload?.success === false) {
+        if (isSubscriptionExpiredPayload(response.status, payload)) {
+          await handleDesktopSubscriptionExpired(payload);
+        }
         if (response.status === 401) {
           await handleDesktopUnauthorized(endpoint);
         }
@@ -1340,6 +1347,9 @@ async function desktopApiRequest<T>(
     });
     const payload = await parseJsonResponse<T & { success?: boolean; error?: string; message?: string }>(response);
     if (!response.ok || payload?.success === false) {
+      if (isSubscriptionExpiredPayload(response.status, payload)) {
+        await handleDesktopSubscriptionExpired(payload);
+      }
       if (response.status === 401) {
         await handleDesktopUnauthorized(endpoint);
       }
@@ -1352,6 +1362,9 @@ async function desktopApiRequest<T>(
     });
     return payload as T;
   } catch (error) {
+    if (error instanceof SubscriptionExpiredError) {
+      throw error;
+    }
     throw error instanceof Error ? error : new Error(extractApiErrorMessage(error));
   } finally {
     if (!options.silent) endRequestLoading();
@@ -3647,8 +3660,20 @@ async function hydrateSubscriptionPayment(root: HTMLElement) {
       name: 'Lerzo SaaS',
       description: `Subscription: ${valueText(plan.name)}`,
       order_id: valueText(order.id),
-      handler: () => {
-        window.location.hash = '#/subscription-success';
+      handler: async (response: Record<string, unknown>) => {
+        try {
+          await desktopApiRequest<Record<string, unknown>>('/subscription/verify-payment', 'POST', {
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_order_id: response.razorpay_order_id,
+            razorpay_signature: response.razorpay_signature,
+          });
+          window.dispatchEvent(new CustomEvent('lerzo-subscription-updated'));
+          window.location.hash = '#/subscription-success';
+        } catch (error) {
+          button.disabled = false;
+          button.innerHTML = originalHtml;
+          showActionToast(root, extractApiErrorMessage(error, 'Payment verification failed.'), 'error');
+        }
       },
       prefill: {
         name: valueText(user.name),

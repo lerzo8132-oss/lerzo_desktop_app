@@ -221,8 +221,10 @@ function Sidebar() {
 
 function AppRoutes() {
   const location = useLocation();
-  const { bootReady, loginCompleting, refreshing, isAuthenticated, authError } = useAuth();
+  const { user, bootReady, loginCompleting, refreshing, isAuthenticated, authError } = useAuth();
   const isPublicPath = publicPaths.has(location.pathname);
+  const isSubscriptionPath = location.pathname.startsWith('/subscription-');
+  const subscriptionInactive = Boolean(user?.subscription && user.subscription.is_active === false);
 
   useBootRouteReady();
   useExistingFlaskScripts();
@@ -250,6 +252,10 @@ function AppRoutes() {
 
   if (isAuthenticated && isPublicPath && location.pathname !== '/auth-error') {
     return <Navigate to={defaultPagePath} replace />;
+  }
+
+  if (isAuthenticated && subscriptionInactive && !isSubscriptionPath) {
+    return <Navigate to="/subscription-plans" replace />;
   }
 
   const routes = (
